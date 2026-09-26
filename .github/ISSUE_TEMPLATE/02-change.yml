@@ -1,0 +1,43 @@
+name: Change
+description: You want the runner to do something it does not.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        This runner implements the [Postern
+        specification](https://github.com/sigrix-io/postern) and nothing
+        more. Behaviour the specification does not define is proposed there
+        first: a runner that grows its own dialect is one every client has to
+        special-case. See
+        [CONTRIBUTING.md](https://github.com/sigrix-io/sigrix-runtime/blob/main/CONTRIBUTING.md)
+        for what fits.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What goes wrong today
+      description: >-
+        Describe the situation, not the feature: what you were running, what
+        the runner did, and what that cost you.
+    validations:
+      required: true
+  - type: textarea
+    id: workaround
+    attributes:
+      label: What you do instead right now
+      description: >-
+        A wrapper script, a patched copy, an option you set around it. What
+        every user would otherwise write for themselves is the strongest case
+        for it living here.
+    validations:
+      required: false
+  - type: dropdown
+    id: specified
+    attributes:
+      label: Does the specification already define this?
+      options:
+        - Yes, and the runner should follow it
+        - No, it would need the specification first
+        - Not sure
+    validations:
+      required: true
