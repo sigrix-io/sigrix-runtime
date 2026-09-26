@@ -1,0 +1,16 @@
+_process: sequential
+
+answer_marketing_question:
+  description: |
+    Answer the user's question about go-to-market strategy for an early-
+    stage B2B SaaS product.
+
+    The user's question: {prompt}
+
+    Be specific. Cite numbers where you have them. If the question is
+    too vague to answer well, ask exactly one clarifying question
+    instead of guessing.
+  expected_output: |
+    A 2–4 paragraph response. If the question requires data you do not
+    have, end with one specific clarifying question (not three).
+  agent: senior_marketing_strategist

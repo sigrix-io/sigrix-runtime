@@ -1,0 +1,32 @@
+# A buyer runs a bundle on Windows and macOS as often as on Linux, and the
+# execution layer is what touches their filesystem and environment: the .env it
+# loads, the workspace it writes, the crew it builds. So those tests run weekly
+# on both, beside ci.yml's Linux runs on every change.
+#
+# The server's tests stay on Linux: they lean on process groups and /proc to
+# check that a stopped run's worker is really gone, which is a POSIX question.
+#
+# Not part of `ci-passed`: a red run here is a report about a platform, not a
+# gate on a pull request.
+name: Cross-platform
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"  # Mondays 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  execution-layer:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: sigrix-io/actions/setup-python-project@765103f1c9d89e019dcaea72a78eed2577b30ae1 # v1.0.0
+        with:
+          python-version: "3.12"
+      - run: python -m pytest tests/test_execution.py tests/test_loader.py tests/test_quiet.py tests/test_sandbox.py

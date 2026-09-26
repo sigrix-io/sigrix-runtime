@@ -1,0 +1,142 @@
+# Lint, type-check, test, check conformance, then prove the package builds and
+# installs.
+#
+# The ruff steps run before pytest deliberately: a formatting slip should fail
+# in ten seconds rather than after the suite. Every job installs from the dev
+# extra, so a local `ruff format` and this check can never disagree about which
+# formatter they run.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: sigrix-io/actions/setup-python-project@765103f1c9d89e019dcaea72a78eed2577b30ae1 # v1.0.0
+      - run: python -m ruff check src/ tests/
+      - run: python -m ruff format --check src/ tests/
+
+  # py.typed ships in the wheel, which tells every consumer's type checker to
+  # trust these annotations. Strict, with the exceptions pyproject.toml names:
+  # the execution layer is where the runner meets CrewAI, which ships no types.
+  types:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: sigrix-io/actions/setup-python-project@765103f1c9d89e019dcaea72a78eed2577b30ae1 # v1.0.0
+      - run: python -m mypy
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: sigrix-io/actions/setup-python-project@765103f1c9d89e019dcaea72a78eed2577b30ae1 # v1.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pytest
+
+  # A floor nobody tests is a guess. The crewai extra declares 1.15.20 as its
+  # floor, and the three tests that build a real crew skip without CrewAI, so
+  # something has to install that floor and run them.
+  crewai-floor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: sigrix-io/actions/setup-python-project@765103f1c9d89e019dcaea72a78eed2577b30ae1 # v1.0.0
+        with:
+          python-version: "3.12"
+          install: -e .[dev,crewai] crewai==1.15.20 crewai-tools==1.15.20
+      - run: python -m pytest
+
+  # The specification's own checker, against this runner rather than a stand-in:
+  # the claim in the README is Level 3, and this is what makes it a check. It
+  # serves the test MCP server's one tool, because a run has to execute for the
+  # run and stream rules to be checked, and a crew would need a model and a key.
+  # The declared level is asserted too, so lowering it cannot pass quietly.
+  conformance:
+    runs-on: ubuntu-latest
+    env:
+      RUNNER: http://127.0.0.1:8791
+      ORIGIN: https://app.example.com
+    steps:
+      - uses: sigrix-io/actions/setup-python-project@765103f1c9d89e019dcaea72a78eed2577b30ae1 # v1.0.0
+      - name: Start the runner
+        run: |
+          set -euo pipefail
+          nohup sigrix-runtime --mcp --port 8791 --allow-origin "$ORIGIN" -- python tests/fixtures/mcp_server.py --single \
+            > "$RUNNER_TEMP/runner.out" 2> "$RUNNER_TEMP/runner.err" &
+          for _ in $(seq 1 100); do
+            grep -q '^POSTERN_PORT=' "$RUNNER_TEMP/runner.out" && exit 0
+            sleep 0.2
+          done
+          cat "$RUNNER_TEMP/runner.err"
+          exit 1
+      - name: Level 3, checked
+        run: python -m postern_conformance "$RUNNER" --execute --origin "$ORIGIN"
+      - name: The level checked is the one declared
+        run: |
+          set -euo pipefail
+          python -m postern_conformance "$RUNNER" --execute --origin "$ORIGIN" --json > "$RUNNER_TEMP/report.json"
+          python - "$RUNNER_TEMP/report.json" <<'PY'
+          import json
+          import sys
+
+          report = json.load(open(sys.argv[1]))
+          assert report["declared_level"] == 3, report["declared_level"]
+          assert report["conformant"], report["summary"]
+          print("Level", report["declared_level"], report["summary"])
+          PY
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: sigrix-io/actions/setup-python-project@765103f1c9d89e019dcaea72a78eed2577b30ae1 # v1.0.0
+        with:
+          install: build twine
+      - run: python -m build
+      # Catches a README that renders on GitHub and not on PyPI.
+      - run: python -m twine check dist/*
+      # The wheel is what users get, and an editable install reads the source
+      # tree, so it would pass either way. From /tmp, so nothing in the checkout
+      # can satisfy the import.
+      - name: The built wheel installs, imports, starts and carries its type marker
+        run: |
+          set -euo pipefail
+          python -m venv /tmp/wheelcheck
+          /tmp/wheelcheck/bin/python -m pip install --quiet dist/*.whl
+          cd /tmp
+          /tmp/wheelcheck/bin/python -c "
+          import pathlib
+          import sigrix_runtime
+          from importlib.metadata import requires
+          root = pathlib.Path(sigrix_runtime.__file__).parent
+          assert 'site-packages' in str(root), root
+          assert (root / 'py.typed').exists(), 'py.typed did not ship'
+          assert not [r for r in requires('sigrix-runtime') or [] if 'extra ==' not in r], 'a dependency outside an extra'
+          print('sigrix-runtime', sigrix_runtime.__version__)
+          "
+          /tmp/wheelcheck/bin/sigrix-runtime --help > /dev/null
+
+  # The aggregate gate. One check to require on main, so adding a job above
+  # does not mean editing a branch protection rule to match.
+  ci-passed:
+    if: always()
+    needs: [lint, types, test, crewai-floor, conformance, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every job succeeded
+        run: |
+          echo '${{ toJSON(needs) }}'
+          [ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" = "false" ]

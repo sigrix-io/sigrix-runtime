@@ -1,0 +1,62 @@
+_process: sequential
+
+summarise_contract:
+  description: |
+    Read the contract text the user supplies and produce a structured
+    summary. Sections (in order):
+
+      1. Parties and effective date
+      2. Term (initial + renewal)
+      3. Payment (amount, frequency, late-fee terms)
+      4. Liability cap and indemnification
+      5. Termination triggers
+      6. IP ownership / licence grant
+      7. Notable non-standard clauses (anything that deviates from
+         typical SaaS-MSA market standard)
+
+    The contract text: {prompt}
+
+    Quote clauses verbatim only when they are non-standard. For
+    boilerplate, summarise to one bullet.
+  expected_output: |
+    A structured summary using the seven section headings above.
+    Each section is at most three bullets except "Notable non-standard
+    clauses" which can be longer if warranted.
+  agent: contract_reader
+
+identify_risks:
+  description: |
+    Given the structured summary, identify the three to five most
+    consequential risks for the buyer-side party. Rank by realistic
+    financial exposure, not by clause length.
+
+    For each risk:
+      - Name the clause (with section reference if available)
+      - State the plain-English risk in one sentence
+      - Propose a specific redline (the exact words to add, change,
+        or strike — not "tighten this" or "consider revising")
+  expected_output: |
+    A numbered list of 3-5 risks. Each entry has three labelled lines:
+    "Clause:", "Risk:", "Redline:".
+  agent: risk_analyst
+  context:
+    - summarise_contract
+
+draft_negotiation_play:
+  description: |
+    Given the risk analyst's findings, produce the negotiation play:
+
+      - Three "must-have" redlines (in order of priority)
+      - Up to two "nice-to-have" redlines we can concede if needed
+      - One "trade card" we will offer to win the must-haves
+
+    For each redline, state in one sentence how it is likely to land
+    with the counterparty (probable acceptance, likely pushback,
+    deal-breaker for them).
+  expected_output: |
+    Three labelled sections: Must-haves, Nice-to-haves, Trade card.
+    Each redline includes the predicted counterparty reaction.
+  agent: negotiation_strategist
+  context:
+    - summarise_contract
+    - identify_risks

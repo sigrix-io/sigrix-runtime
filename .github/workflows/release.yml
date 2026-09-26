@@ -1,0 +1,161 @@
+# Publish a tagged release to PyPI. Nothing else in this repository publishes,
+# and nothing in this file runs on a branch: a release is a tag, so publishing
+# is an act with a name rather than a side effect of a merge.
+#
+# Trusted publishing (OIDC) rather than an API token: the runner exchanges a
+# short-lived identity for an upload, so there is no long-lived secret in this
+# repository to store, leak or rotate. PyPI has to be told which workflow in
+# which environment it trusts; VERSIONING.md § Releasing has both halves.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+# Never cancelled: a run cancelled mid-upload can leave a release half-landed,
+# and a PyPI version number can never be reused.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Everything that can say no, said before anything leaves the runner.
+  build:
+    runs-on: ubuntu-latest
+    # A fork can push a tag to itself; it must not build what this
+    # repository's trust policy would then be asked to publish.
+    if: github.repository == 'sigrix-io/sigrix-runtime'
+    steps:
+      - uses: sigrix-io/actions/setup-python-project@765103f1c9d89e019dcaea72a78eed2577b30ae1 # v1.0.0
+        with:
+          install: build twine
+      - run: python -m build
+
+      # The version is read from src/sigrix_runtime/__init__.py and the tag is
+      # typed by hand, so nothing makes them agree but this.
+      - name: The tag names the version that was actually built
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          # sigrix_runtime-0.1.0-py3-none-any.whl -> 0.1.0: "-" separates a
+          # wheel filename's fields, and a PEP 440 version never contains one.
+          built="$(basename "$(ls dist/*.whl)" | cut -d- -f2)"
+          echo "tag=${tag}  built=${built}"
+          if [ "${tag}" != "${built}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not name the packaged version ${built}. Move __version__, or delete the tag and retag."
+            exit 1
+          fi
+
+      # A release nobody wrote down is one a dependent cannot evaluate, which is
+      # the promise VERSIONING.md makes while this is 0.x. Anything still filed
+      # under [Unreleased] is on the commit being tagged, so it ships in this
+      # release while the changelog says it did not.
+      - name: The changelog names this version, and nothing is left unreleased
+        run: |
+          set -euo pipefail
+          export VERSION="${GITHUB_REF_NAME#v}"
+          python - <<'PY'
+          import os
+          import pathlib
+          import re
+
+          version = os.environ["VERSION"]
+          text = pathlib.Path("CHANGELOG.md").read_text()
+
+
+          def fail(message: str) -> None:
+              print(message)
+              raise SystemExit(1)
+
+
+          if f"## [{version}]" not in text:
+              fail(f"::error::CHANGELOG.md has no '## [{version}]' heading.")
+          section = re.search(r"^##\s*\[Unreleased\]\s*$(.*?)(?=^##\s|\Z)", text, re.MULTILINE | re.DOTALL)
+          if section:
+              leftover = [
+                  line for line in section.group(1).splitlines() if line.strip() and not line.lstrip().startswith("#")
+              ]
+              if leftover:
+                  fail(
+                      f"::error::CHANGELOG.md still files {len(leftover)} line(s) under [Unreleased], "
+                      f"starting {leftover[0].strip()[:60]!r}; move them under '## [{version}]'."
+                  )
+          PY
+
+      - run: python -m twine check dist/*
+
+      # ci.yml proves the source tree passes. This proves the artifact does,
+      # which is the only question left once the bytes are immutable on PyPI:
+      # a file missing from the wheel is invisible to an editable install.
+      - name: The built wheel installs, imports, and passes the suite
+        run: |
+          set -euo pipefail
+          python -m venv /tmp/releasecheck
+          /tmp/releasecheck/bin/python -m pip install --quiet dist/*.whl pytest "postern-conformance==0.1.2" "PyYAML>=6.0"
+          cd /tmp
+          /tmp/releasecheck/bin/python -c "
+          import pathlib
+          import sigrix_runtime
+          root = pathlib.Path(sigrix_runtime.__file__).parent
+          assert 'site-packages' in str(root), root
+          assert (root / 'py.typed').exists(), 'py.typed did not ship'
+          print('sigrix-runtime', sigrix_runtime.__version__)
+          "
+          cd "${GITHUB_WORKSPACE}"
+          # src-layout means ./sigrix_runtime does not exist, so the suite can
+          # only import the wheel in the venv.
+          /tmp/releasecheck/bin/python -m pytest tests/
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  # Separate from the build so a failure above cannot half-publish: this job
+  # does not start unless every check passed, and it builds nothing itself.
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      # PyPI's trusted-publisher policy names this environment beside the
+      # repository and the workflow file, so all three must match it.
+      name: pypi
+      url: https://pypi.org/p/sigrix-runtime
+    permissions:
+      # The only elevated permission in this file: the OIDC token PyPI
+      # exchanges for an upload.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+
+  # An upload that succeeds is not the same as a package anyone can install,
+  # and the two look identical from the publish step. Install by name from the
+  # index the upload just went to, the way a buyer or a bundle build would.
+  verify:
+    needs: [build, publish]
+    runs-on: ubuntu-latest
+    steps:
+      - id: tag
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - id: published
+        uses: sigrix-io/actions/verify-published-package@765103f1c9d89e019dcaea72a78eed2577b30ae1 # v1.0.0
+        with:
+          package: sigrix-runtime
+          version: ${{ steps.tag.outputs.version }}
+          import-name: sigrix_runtime
+
+      - name: The published runner starts
+        run: |
+          set -euo pipefail
+          cd /tmp
+          ${{ steps.published.outputs.python }} -m sigrix_runtime.postern --help > /dev/null
+          echo "python -m sigrix_runtime.postern answers"

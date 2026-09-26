@@ -1,0 +1,139 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sigrix-runtime"
+# Read from `src/sigrix_runtime/__init__.py` rather than written here: the
+# runner reports `__version__` and this file feeds the wheel, so two copies
+# would be one fact in two places, each looking right in its own file.
+dynamic = ["version"]
+description = "The Postern runner inside every Sigrix bundle: serves one agent's describe, run, stream and status on loopback, checks the buyer's entitlement, and serves an MCP server's tools over the same four verbs."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.11"
+authors = [{ name = "Sigrix" }]
+keywords = ["postern", "agents", "mcp", "crewai", "runner", "entitlement"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
+    "Topic :: Software Development :: Libraries",
+    "Typing :: Typed",
+]
+
+# The server is standard library only, and a test holds it to that: it is the
+# half of a bundle that has to start before anything is installed, and it is
+# what serves an MCP server's tools with nothing else present.
+dependencies = []
+
+[project.optional-dependencies]
+# What the execution layer drives when a bundle is a CrewAI crew. Ranges, not
+# pins: a bundle's own requirements.txt pins the exact versions it ships, and
+# these say which versions this code runs with. The floor is the release the
+# suite runs against.
+crewai = [
+    "crewai>=1.15.20,<2",
+    "crewai-tools>=1.15.20,<2",
+    "python-dotenv>=1.2.2,<2",
+    "PyYAML>=6.0",
+]
+dev = [
+    "pytest>=8.0",
+    "ruff==0.16.8",
+    "mypy==2.3.1",
+    "types-PyYAML>=6.0",
+    "PyYAML>=6.0",
+    "postern-conformance==0.1.2",
+]
+
+[project.scripts]
+sigrix-runtime = "sigrix_runtime.postern.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/sigrix-io/sigrix-runtime"
+Source = "https://github.com/sigrix-io/sigrix-runtime"
+Issues = "https://github.com/sigrix-io/sigrix-runtime/issues"
+Changelog = "https://github.com/sigrix-io/sigrix-runtime/blob/main/CHANGELOG.md"
+Specification = "https://github.com/sigrix-io/postern"
+
+[tool.hatch.version]
+path = "src/sigrix_runtime/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sigrix_runtime"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/sigrix_runtime", "tests", "README.md", "LICENSE", "NOTICE", "CHANGELOG.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+src = ["src"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "I",    # isort
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "SIM",  # flake8-simplify
+    "S",    # flake8-bandit
+]
+ignore = [
+    "E501",    # the formatter owns line length
+    "SIM102",  # nested if: often clearer than one long condition
+    "SIM105",  # try/except/pass names what it swallows where it swallows it
+    "SIM108",  # ternary operator: a readability preference
+]
+
+[tool.ruff.lint.per-file-ignores]
+# assert is the whole vocabulary of a test, and the fixtures' tokens, paths,
+# addresses and subprocesses name nothing real.
+"tests/**/*.py" = ["S101", "S104", "S105", "S106", "S108", "S603", "S607"]
+# The asserts narrow a subprocess pipe the type checker cannot see is open.
+"src/sigrix_runtime/postern/engine.py" = ["S101"]
+"src/sigrix_runtime/postern/mcp.py" = ["S101"]
+# Progress reporting must never be why a run fails, so a callback CrewAI
+# refuses is dropped rather than raised.
+"src/sigrix_runtime/execution.py" = ["S110"]
+# The panel's answers come back from one gather over the same unit crews,
+# so the two sequences are the same length by construction.
+"src/sigrix_runtime/workforce.py" = ["B905"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["sigrix_runtime"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.mypy]
+strict = true
+python_version = "3.11"
+files = ["src/sigrix_runtime"]
+mypy_path = "src"
+
+# CrewAI and python-dotenv ship no type information. The execution layer is
+# where the runner meets them, so its decorators and base classes are Any
+# there, and strict mode would read every function they touch as untyped.
+[[tool.mypy.overrides]]
+module = ["crewai", "crewai.*", "crewai_tools", "dotenv"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["sigrix_runtime.sandbox", "sigrix_runtime.workforce"]
+disallow_untyped_decorators = false
+disallow_subclassing_any = false

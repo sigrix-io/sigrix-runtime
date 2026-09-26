@@ -1,0 +1,98 @@
+_process: sequential
+
+draft_launch_plan:
+  description: |
+    Read the user's launch brief and produce a 4-week launch plan.
+
+    The user's brief: {prompt}
+
+    The plan must be ordered week by week. Each week names: the goal,
+    the experiments, and what success looks like. Reject vague verbs
+    ("amplify", "engage") in favour of specific ones ("publish",
+    "send", "schedule").
+  expected_output: |
+    A 4-week plan, one paragraph per week. Each week begins with
+    "Week N — [goal]:" and ends with one sentence stating what success
+    looks like.
+  agent: launch_strategist
+
+write_positioning:
+  description: |
+    Read the launch plan and draft the buyer-facing copy that fits it:
+
+      - Landing page hero (one sentence)
+      - Two-line value proposition
+      - Three feature bullets
+      - FAQ defusing the single most likely objection
+
+    Cut adjectives. Each line must name a benefit a real buyer would
+    notice within 30 seconds of reading.
+  expected_output: |
+    Markdown with H3 headings: Hero, Value proposition, Features, FAQ.
+    No paragraph longer than three sentences.
+  agent: positioning_writer
+  context:
+    - draft_launch_plan
+
+pick_channels:
+  description: |
+    Given the launch plan and the positioning copy, pick at most two
+    launch channels. For each: state the rationale (why this channel
+    fits the buyer), the budget allocation as a percentage of total
+    launch spend, and the weekly cadence. Justify any second channel
+    with a sentence on what makes it a meaningful test versus the
+    first.
+  expected_output: |
+    A short table or bullet list naming each channel with: rationale
+    (one sentence), budget % (number), weekly cadence (e.g. "3 posts
+    + 1 outbound batch"). If only one channel is selected, say so
+    explicitly and explain why a second was rejected.
+  agent: channel_planner
+  context:
+    - draft_launch_plan
+    - write_positioning
+
+define_metrics:
+  description: |
+    Given the launch plan and channel selection, define the success
+    metrics. Separate "leading" (visible by end of week 1) from
+    "lagging" (visible by end of week 4). For each metric: name the
+    metric, the target value, and the trigger threshold below which
+    the team should course-correct.
+  expected_output: |
+    Two lists: Leading indicators (3-5 metrics) and Lagging indicators
+    (2-3 metrics). Each entry: "metric — target — course-correct
+    trigger".
+  agent: metrics_analyst
+  context:
+    - draft_launch_plan
+    - pick_channels
+
+assemble_launch_brief:
+  description: |
+    Synthesise the plan, copy, channels, and metrics into a single
+    one-page launch brief the founder can hand to the team on Monday
+    morning. Order: TL;DR (3 sentences), week-by-week plan, copy block,
+    channel plan, metrics. Cut everything that does not change a
+    decision.
+
+    Then deliver the brief as files using the file_write tool:
+
+      - Write the full one-page brief to 'launch_brief.md'.
+      - Write the channel plan and both metrics lists to
+        'channel_plan.md' so the growth owner has a standalone copy.
+
+    Finally, answer in chat with only the TL;DR and the sentence
+    "Full brief written to workspace/launch_brief.md and
+    workspace/channel_plan.md."
+  expected_output: |
+    Two files written via file_write — launch_brief.md (the full
+    one-page Markdown brief, no longer than 500 words) and
+    channel_plan.md (channel plan + metrics) — and a chat answer
+    consisting of the TL;DR plus the sentence naming both files.
+  agent: launch_coordinator
+  context:
+    - draft_launch_plan
+    - write_positioning
+    - pick_channels
+    - define_metrics

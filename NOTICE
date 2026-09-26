@@ -1,0 +1,10 @@
+sigrix-runtime
+Copyright 2026 Sigrix
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Trademarks. "Sigrix" and the Sigrix logo are trademarks of Sigrix. The Apache
+License does not grant permission to use them. The name of this repository and
+package identifies the marketplace whose bundles this runner serves; it does
+not imply endorsement of a derivative work. A fork or a derived runner must not
+present itself as Sigrix or as published by Sigrix.

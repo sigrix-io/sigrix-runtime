@@ -1,0 +1,23 @@
+# Keeps the two things this repository pins from ageing quietly: the dev tools
+# in pyproject.toml, and the commits every workflow's `uses:` names. A pin only
+# stays correct if something bumps it. A bump that breaks anything arrives as a
+# red check on a pull request nobody has merged, and `ci-passed` is required on
+# `main`, so it cannot land without passing.
+#
+# Dependabot reads the `# vX.Y.Z` comment beside each SHA to know what it is
+# bumping from, so a pin written without one goes stale;
+# `tests/test_workflow_pins.py` fails if either half slips.
+#
+# Deliberately no auto-merge: whether these should merge themselves when green
+# is a judgement to take on the record, not to default into.
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

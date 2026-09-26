@@ -1,0 +1,22 @@
+_process: hierarchical
+_manager: team_lead
+
+answer_request:
+  description: |
+    Answer the user's question by delegating it to the single
+    specialist who owns it: qa_engineer (testing, quality risk,
+    release safety), software_architect (system design, performance,
+    technical direction), or product_designer (user experience,
+    flows, adoption). Have that specialist answer in depth, then
+    shape their answer into the final response.
+
+    The user's question: {prompt}
+
+    Open the final answer with the routing line ("Routed to:
+    [specialist] — [one-sentence reason]"), then the specialist's
+    answer, and close with a three-item "Do this first" list drawn
+    from it.
+  expected_output: |
+    A single Markdown answer: the routing line ("Routed to: ..."),
+    the owning specialist's in-depth answer, and a final three-item
+    action list. No longer than one page.
