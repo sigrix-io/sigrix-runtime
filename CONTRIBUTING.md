@@ -47,7 +47,9 @@ postern-conformance http://127.0.0.1:8791 --execute
 ## Pull requests
 
 - One change per pull request, with a test that fails without it.
-- `CHANGELOG.md` gets a line under *Unreleased*.
+- `CHANGELOG.md` gets a line under *Unreleased* for anything a client, a buyer
+  or a bundle would notice. Repository housekeeping (CI, templates, the tests'
+  own plumbing) does not.
 - A change to what a verb answers, or to an option or variable a buyer sets, is
   a breaking change for somebody's client or container; say so in the
   changelog.

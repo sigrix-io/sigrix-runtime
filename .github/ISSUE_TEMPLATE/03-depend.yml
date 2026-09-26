@@ -1,0 +1,41 @@
+name: I depend on this
+description: Not a defect. Tell us you are building on 0.x so a breaking change reaches you before it lands.
+labels: ["dependent"]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        [VERSIONING.md](https://github.com/sigrix-io/sigrix-runtime/blob/main/VERSIONING.md)
+        says that before 1.0 a minor release may carry what would later be a
+        major one. This form is the other half of that bargain: an announced
+        breaking change and a surprising one differ by whether we knew
+        somebody was there.
+  - type: input
+    id: version
+    attributes:
+      label: Which version are you pinned to?
+      placeholder: "sigrix-runtime>=0.1,<0.2"
+    validations:
+      required: true
+  - type: checkboxes
+    id: surface
+    attributes:
+      label: Which parts do you use?
+      description: This is what tells us which change would cost you something.
+      options:
+        - label: "`describe`, `run`, `stream` and `status` over HTTP, from a client of my own"
+        - label: "`--mcp`, serving an MCP server's tools"
+        - label: "The entitlement check and the pull, against a distributor of my own"
+        - label: "The execution layer, from a bundle of my own"
+        - label: "The options and variables, from a container or a service manager"
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else worth knowing
+      description: >-
+        What you are building, and whether a changed answer would break you or
+        merely show up in a diff. No obligation to name your project.
+    validations:
+      required: false

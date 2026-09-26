@@ -1,0 +1,53 @@
+name: Defect
+description: The runner answers differently from the specification, or gets an entitlement check, a pull or an MCP call wrong.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        **Never paste a token or a key.** Not `SIGRIX_TOKEN`, not a runner
+        token, not a provider key from a bundle's `.env`. The runner writes
+        none of them to its output; if something you are about to paste
+        carries one, that is a vulnerability, so email security@sigrix.io
+        instead of filing it here.
+  - type: textarea
+    id: command
+    attributes:
+      label: How you started the runner
+      description: >-
+        The command, with its options, and the names (not the values) of the
+        `POSTERN_` and `SIGRIX_` variables you set.
+      render: shell
+      placeholder: "sigrix-runtime --mcp --port 8791 -- python server.py"
+    validations:
+      required: true
+  - type: textarea
+    id: exchange
+    attributes:
+      label: The request and the answer
+      description: >-
+        The verb, what you sent, and the status and body that came back. For
+        `stream`, the events in the order they arrived. An exchange is a
+        report that can become a test in one step.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected, and why
+      description: >-
+        Where the specification says otherwise, name the section (`§4.2`)
+        and quote the sentence: where this code and the document disagree,
+        the code is the one to change. `postern-conformance` output is
+        welcome here too, if it reports a failure.
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: sigrix-runtime, Python, the operating system, and CrewAI if a crew was running.
+      placeholder: "sigrix-runtime 0.1.0, Python 3.12, macOS 15"
+    validations:
+      required: true

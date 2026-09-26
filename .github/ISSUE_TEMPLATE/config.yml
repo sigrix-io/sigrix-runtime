@@ -1,0 +1,24 @@
+# The three forms alongside this file are the three kinds of report
+# CONTRIBUTING.md treats differently: the runner disagreeing with the
+# specification, a change, and a dependent saying so. A blank issue would let
+# that sorting be skipped.
+blank_issues_enabled: false
+
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/sigrix-io/sigrix-runtime/security/policy
+    about: >-
+      Do not open a public issue. Email security@sigrix.io, acknowledged within
+      three working days. The runner holds a buyer's token and serves on their
+      machine, so a way to reach either is in scope.
+  - name: Raise a code of conduct concern
+    url: https://github.com/sigrix-io/sigrix-runtime/blob/main/CODE_OF_CONDUCT.md
+    about: >-
+      Email conduct@sigrix.io. A different address and a different queue from
+      security reports; neither is a fallback for the other.
+  - name: A question about the Postern specification
+    url: https://github.com/sigrix-io/postern/issues
+    about: >-
+      What a verb should answer is the specification's to say. If the document
+      is unclear or wrong, ask there; if this runner disagrees with the
+      document, file a defect here.
