@@ -8,6 +8,13 @@
 # bumping from, so a pin written without one goes stale;
 # `tests/test_workflow_pins.py` fails if either half slips.
 #
+# One pull request per ecosystem, not one per dependency. The branch ruleset
+# only merges a pull request that is up to date with main, so every merge puts
+# every other open update behind, and each then needs `@dependabot rebase` and
+# a fresh CI run before it can follow. A group costs one round of that. The
+# price is that a bump which breaks something holds back the rest of its group
+# until it is fixed, or excluded with `@dependabot ignore <dependency>`.
+#
 # Deliberately no auto-merge: whether these should merge themselves when green
 # is a judgement to take on the record, not to default into.
 version: 2
@@ -16,8 +23,16 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    groups:
+      python-dependencies:
+        patterns:
+          - "*"
 
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
+    groups:
+      github-actions:
+        patterns:
+          - "*"

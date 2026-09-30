@@ -6,6 +6,13 @@ described in `VERSIONING.md`.
 
 ## [Unreleased]
 
+### Changed
+
+- Dependabot opens one pull request per ecosystem instead of one per
+  dependency. The branch ruleset only merges a pull request that is up to date
+  with `main`, so each separate update merged put every other one behind.
+  Nothing in the package changes.
+
 ## [0.1.0] - 2026-09-26
 
 First release as a package of its own. The same code has shipped inside every
