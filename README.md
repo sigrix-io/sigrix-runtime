@@ -1,5 +1,10 @@
 # sigrix-runtime
 
+[![PyPI](https://img.shields.io/pypi/v/sigrix-runtime)](https://pypi.org/project/sigrix-runtime/)
+[![Python](https://img.shields.io/pypi/pyversions/sigrix-runtime)](https://pypi.org/project/sigrix-runtime/)
+[![CI](https://github.com/sigrix-io/sigrix-runtime/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/sigrix-io/sigrix-runtime/actions/workflows/ci.yml)
+[![Licence](https://img.shields.io/github/license/sigrix-io/sigrix-runtime)](https://github.com/sigrix-io/sigrix-runtime/blob/main/LICENSE)
+
 The [Postern](https://github.com/sigrix-io/postern) runner inside every bundle
 [Sigrix](https://sigrix.io) delivers. It serves one agent on your own machine
 over Postern's four verbs, checks that you are entitled to run it, and runs it
@@ -125,6 +130,27 @@ $ pip install "sigrix-runtime[crewai]"
 - `sigrix_runtime.execution`, `loader`, `workforce`, `sandbox`, `configuration`,
   `quiet`, `runner_env`: the one run path a bundle's `main.py` and the server
   share, and what it needs to build and run a crew.
+
+## Where it fits
+
+sigrix-runtime is one of the open-source projects [Sigrix](https://sigrix.io)
+publishes. The others it meets:
+
+- **[Postern](https://github.com/sigrix-io/postern)**, the specification this
+  runner serves.
+- **[postern-conformance](https://pypi.org/project/postern-conformance/)**
+  (`pip install postern-conformance`), the checker CI holds this runner to.
+  Point it at yours too.
+- **[Gatehouse](https://github.com/sigrix-io/gatehouse)**
+  (`npm install @sigrix-io/gatehouse`), the page a person runs an agent from
+  in the browser. Give it this runner's address, and start the runner with
+  `--allow-origin` set to the page's origin.
+- **[sigrix-launcher](https://github.com/sigrix-io/sigrix-launcher)**, which
+  starts an MCP server a buyer bought on Sigrix: it checks the purchase and
+  downloads the seller's package with this package's client code.
+
+Every project Sigrix publishes, and a map of how they connect:
+[sigrix.io/open-source](https://sigrix.io/open-source).
 
 ## Versioning and licence
 
