@@ -13,6 +13,10 @@ described in `VERSIONING.md`.
   meet at this runner: Postern, the checker CI holds it to, Gatehouse and
   sigrix-launcher. The README is the PyPI page too, so the next release
   carries it there. Nothing a client or a buyer sees changes.
+- The README carries the project's logo above its title, and readers in
+  GitHub's dark mode are shown a version drawn for it. The README is the PyPI
+  page too, so the next release carries the logo there. Nothing in the package
+  changes.
 - Dependabot opens one pull request per ecosystem instead of one per
   dependency. The branch ruleset only merges a pull request that is up to date
   with `main`, so each separate update merged put every other one behind.
