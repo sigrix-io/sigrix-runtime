@@ -47,8 +47,8 @@ crewai = [
 ]
 dev = [
     "pytest>=8.0",
-    "ruff==0.17.1",
-    "mypy==2.4.0",
+    "ruff==0.17.3",
+    "mypy==2.4.1",
     "types-PyYAML>=6.0",
     "PyYAML>=6.0",
     "postern-conformance==0.1.2",
