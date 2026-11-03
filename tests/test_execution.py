@@ -14,6 +14,8 @@ order the docstrings describe but a full run only ever exercises once.
 
 from __future__ import annotations
 
+import threading
+import time
 from typing import Any
 
 from sigrix_runtime.execution import (  # noqa: E402
@@ -24,6 +26,8 @@ from sigrix_runtime.execution import (  # noqa: E402
     _attach_usage,
     _crew_usage_snapshot,
     _resolved_model_id,
+    _StepRecorder,
+    _summed_counts,
     cache_split,
 )
 
@@ -337,3 +341,122 @@ def test_a_run_whose_result_carries_no_cache_fields_leaves_them_unset() -> None:
     assert outcome.input_tokens == 4210
     assert outcome.cache_write_tokens is None
     assert outcome.cache_read_tokens is None
+
+
+# ---------------------------------------------------------------------------
+# A workforce: several crews, one run
+# ---------------------------------------------------------------------------
+
+
+def test_a_step_is_named_under_the_crew_it_came_from() -> None:
+    crew = _Crew(usage_answers=[_Usage(10, 5)])
+    calls, record = _recorder()
+    _attach_task_callback(crew, record, model_id="", prefix="review")
+    crew.task_callback(_TaskOutput(name="summarise_contract"))
+    crew2 = _Crew(usage_answers=[_Usage(10, 5)])
+    _attach_task_callback(crew2, record, model_id="", prefix="review")
+    crew2.task_callback(_TaskOutput(name=None, description=""))
+    assert [name for name, _ in calls] == ["review.summarise_contract", "review.task"]
+
+
+def test_the_run_spent_what_every_crew_spent() -> None:
+    crews = [
+        _Crew(usage_answers=[_CachedUsage(1600, 300, written=1000, read=500)]),
+        _Crew(usage_answers=[_CachedUsage(3200, 600, written=1000, read=1500)]),
+    ]
+    total = _summed_counts(crews)
+    assert total is not None
+    assert (total.prompt_tokens, total.completion_tokens) == (4800, 900)
+    assert (total.cache_write_tokens, total.cache_read_tokens) == (2000, 2000)
+
+
+def test_a_crew_that_cannot_say_what_it_spent_leaves_the_run_unmeasured() -> None:
+    """All or nothing: the sum of the others is a smaller number, not a known one."""
+    crews = [_Crew(usage_answers=[_Usage(1600, 300)]), _Crew(raises=True)]
+    assert _summed_counts(crews) is None
+
+
+def test_a_crew_with_no_cache_fields_leaves_the_run_s_cache_split_unknown() -> None:
+    crews = [
+        _Crew(usage_answers=[_CachedUsage(1600, 300, written=1000, read=500)]),
+        _Crew(usage_answers=[_Usage(10, 5)]),
+    ]
+    total = _summed_counts(crews)
+    assert total is not None
+    assert (total.prompt_tokens, total.completion_tokens) == (1610, 305)
+    assert (total.cache_write_tokens, total.cache_read_tokens) == (None, None)
+
+
+def test_a_workforce_that_built_no_crew_measured_nothing() -> None:
+    assert _summed_counts([]) is None
+
+
+def test_two_steps_finishing_at_once_are_handed_on_one_at_a_time() -> None:
+    """A panel's units finish on threads of their own, and the worker writes each
+    step as a frame: two written at once could interleave."""
+    spans: list[tuple[float, float]] = []
+
+    def slow_writer(_step: RunStep) -> None:
+        began = time.monotonic()
+        time.sleep(0.2)
+        spans.append((began, time.monotonic()))
+
+    recorder = _StepRecorder(slow_writer)
+    together = threading.Barrier(2)
+
+    def finish(name: str) -> None:
+        together.wait()
+        recorder(name, latency_ms=5, input_tokens=1, output_tokens=1)
+
+    threads = [threading.Thread(target=finish, args=(name,)) for name in ("review.one", "build.one")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    first, second = sorted(spans)
+    assert first[1] <= second[0], "two steps were written at once"
+    assert sorted(step.name for step in recorder.steps) == ["build.one", "review.one"]
+
+
+class _KickedOffCrew(_Crew):
+    """A crew that says when its kickoff starts, as crewai's ``before_kickoff_callbacks`` do."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.before_kickoff_callbacks: list[Any] = []
+
+    def start(self) -> None:
+        for callback in self.before_kickoff_callbacks:
+            callback({})
+
+
+def test_a_step_is_timed_from_its_own_crew_s_start() -> None:
+    """A pipeline builds its second unit with its first; timed from then, its first
+    step would carry the whole first unit's run."""
+    crew = _KickedOffCrew(usage_answers=[_Usage(10, 5)])
+    calls, record = _recorder()
+    _attach_task_callback(crew, record, model_id="")
+    time.sleep(0.3)  # the first unit runs
+    crew.start()
+    crew.task_callback(_TaskOutput(name="first"))
+    assert calls[0][1]["latency_ms"] < 150
+
+
+def test_a_crew_that_cannot_say_when_it_started_is_timed_from_its_callback() -> None:
+    crew = _Crew(usage_answers=[_Usage(10, 5)])
+    calls, record = _recorder()
+    _attach_task_callback(crew, record, model_id="")
+    time.sleep(0.2)
+    crew.task_callback(_TaskOutput(name="first"))
+    assert calls[0][1]["latency_ms"] >= 150
+
+
+def test_each_step_after_the_first_is_timed_from_its_crew_s_last() -> None:
+    crew = _KickedOffCrew(usage_answers=[_Usage(10, 5), _Usage(20, 10)])
+    calls, record = _recorder()
+    _attach_task_callback(crew, record, model_id="")
+    crew.start()
+    crew.task_callback(_TaskOutput(name="first"))
+    time.sleep(0.2)
+    crew.task_callback(_TaskOutput(name="second"))
+    assert calls[1][1]["latency_ms"] >= 150

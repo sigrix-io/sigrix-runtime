@@ -59,10 +59,10 @@ WORKSPACE_DIRNAME = "workspace"
 PROMPT_INPUT_KEY = "prompt"
 
 # The environment variable crewai reads its model from, and the one the
-# generated ``.env.example`` documents as the optional override. The single
-# crew path (below) prefers the model crewai itself resolved over this — see
-# ``_resolved_model_id`` — so this is now only the workforce path's answer,
-# since ``execute()`` builds no crew there this module can introspect.
+# generated ``.env.example`` documents as the optional override. Both run
+# paths prefer the model crewai itself resolved over this — see
+# ``_resolved_model_id``, read off the crew, or off each crew a workforce
+# builds — so this is only the answer when no crew names one.
 MODEL_ENV_KEY = "OPENAI_MODEL_NAME"
 
 # Where a step carries what Postern's ``usage`` has no member for. Unknown
@@ -273,45 +273,28 @@ def execute(
     workspace = prepare_environment(bundle_root)
     before_run = _workspace_files(workspace)
 
-    # The workforce path builds no crew this module can introspect, so this
-    # is its whole answer: the buyer's own explicit override, or nothing.
-    # The single-crew branch below upgrades it to what CrewAI actually
-    # resolved, which is why this is reassigned rather than read again later.
+    # The buyer's own explicit override, or nothing, until a crew is built:
+    # both branches below upgrade it to what CrewAI actually resolved, which
+    # is why this is reassigned rather than read again later.
     model_id = str(os.environ.get(MODEL_ENV_KEY) or "").strip()
-    steps: list[RunStep] = []
-    step_clock = {"last": time.perf_counter()}
+    recorder = _StepRecorder(on_step)
+    steps = recorder.steps
+    # Every crew a workforce builds, units and its own, for the run's totals.
+    workforce_crews: list[Any] = []
 
-    def _record(
-        name: str,
-        *,
-        model_id: str = "",
-        input_tokens: int | None = None,
-        output_tokens: int | None = None,
-        cache_write_tokens: int | None = None,
-        cache_read_tokens: int | None = None,
-    ) -> None:
-        now = time.perf_counter()
-        step = RunStep(
-            name=name,
-            latency_ms=int((now - step_clock["last"]) * 1000),
-            model_id=model_id,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            cache_write_tokens=cache_write_tokens,
-            cache_read_tokens=cache_read_tokens,
-        )
-        step_clock["last"] = now
-        steps.append(step)
-        if on_step is not None:
-            # Raising here aborts the run, which is how a disconnected
-            # stream client stops an agent: the relay's write fails, the
-            # exception unwinds through crewai, and no further task starts.
-            on_step(step)
+    def _instrument(crew: Any, prefix: str) -> None:
+        # A workforce's unit crews and its own, each reporting its tasks as a
+        # single crew does, its steps named under its unit's key.
+        workforce_crews.append(crew)
+        _attach_task_callback(crew, recorder, model_id=_resolved_model_id(crew) or model_id, prefix=prefix)
 
     try:
         manifest, manifest_error = _load_workforce_manifest(bundle_root / "config")
         if manifest is not None:
-            result = workforce.run_workforce(manifest, prompt=prompt, workspace=workspace, configuration=config_block)
+            result = workforce.run_workforce(
+                manifest, prompt=prompt, workspace=workspace, configuration=config_block, on_crew=_instrument
+            )
+            model_id = next((m for m in map(_resolved_model_id, workforce_crews) if m), model_id)
         else:
             if manifest_error is not None and on_notice is not None:
                 on_notice(
@@ -321,7 +304,7 @@ def execute(
             tools = sandbox.build_tools(config.tool_refs, workspace=workspace)
             crew = loader.build_crew(config, tools)
             model_id = _resolved_model_id(crew) or model_id
-            _attach_task_callback(crew, _record, model_id=model_id)
+            _attach_task_callback(crew, recorder, model_id=model_id)
             result = crew.kickoff(inputs={"prompt": prompt, "configuration": config_block})
     except ModuleNotFoundError as exc:
         # crewai and its tree are imported lazily, so a bundle whose
@@ -345,11 +328,58 @@ def execute(
         workforce=manifest is not None,
         model_id=model_id,
     )
-    _attach_usage(outcome, result)
+    if manifest is not None:
+        # A Flow's answer is text, with no usage on it: the run spent what
+        # every crew it built spent.
+        _attach_totals(outcome, _summed_counts(workforce_crews))
+    else:
+        _attach_usage(outcome, result)
     return outcome
 
 
 # --- Internals -------------------------------------------------------
+
+
+class _StepRecorder:
+    """Every finished step of a run, kept and handed on one at a time.
+
+    A workforce's panel runs its units on threads of their own, so two tasks
+    can finish together. The lock keeps the list and the frames the worker
+    writes from interleaving.
+    """
+
+    def __init__(self, on_step: Callable[[RunStep], None] | None) -> None:
+        self.steps: list[RunStep] = []
+        self._on_step = on_step
+        self._lock = threading.Lock()
+
+    def __call__(
+        self,
+        name: str,
+        *,
+        latency_ms: int = 0,
+        model_id: str = "",
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        cache_write_tokens: int | None = None,
+        cache_read_tokens: int | None = None,
+    ) -> None:
+        step = RunStep(
+            name=name,
+            latency_ms=max(0, latency_ms),
+            model_id=model_id,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_write_tokens=cache_write_tokens,
+            cache_read_tokens=cache_read_tokens,
+        )
+        with self._lock:
+            self.steps.append(step)
+            if self._on_step is not None:
+                # Raising here aborts the run, which is how a disconnected
+                # stream client stops an agent: the relay's write fails, the
+                # exception unwinds through crewai, and no further task starts.
+                self._on_step(step)
 
 
 def _load_workforce_manifest(config_dir: Path) -> tuple[Any | None, Exception | None]:
@@ -366,8 +396,12 @@ def _load_workforce_manifest(config_dir: Path) -> tuple[Any | None, Exception | 
         return None, exc
 
 
-def _attach_task_callback(crew: Any, record: Callable[..., None], *, model_id: str) -> None:
+def _attach_task_callback(crew: Any, record: Callable[..., None], *, model_id: str, prefix: str = "") -> None:
     """Report each finished task through crewai's own callback, if it has one.
+
+    ``prefix`` names the crew a step came from when there is more than one: a
+    workforce's step is ``<unit key>.<task>``, as its ``describe`` lists the
+    task, and its own crews' steps ``workforce.<task>``.
 
     Guarded rather than assumed: ``task_callback`` is not part of anything
     this bundle pins, and a crewai release that drops or renames it should
@@ -393,9 +427,27 @@ def _attach_task_callback(crew: Any, record: Callable[..., None], *, model_id: s
 
     The cache counts are deltas of crewai's own running totals in the same
     way, and stay ``None`` for a crewai whose totals do not carry them.
+
+    **A step's ``latency_ms`` is its own crew's time.** SPEC 4.3 makes it the
+    step's elapsed time, so each crew keeps its own clock, started when its
+    kickoff starts (crewai's ``before_kickoff_callbacks``) and moved on at each
+    of its steps. One clock for the run read a panel's units against each
+    other: a unit finishing just after another reported nothing. A crewai
+    without that list times the first step from here.
     """
     lock = threading.Lock()
     previous = _Counts(prompt_tokens=0, completion_tokens=0, cache_write_tokens=0, cache_read_tokens=0)
+    clock = {"last": time.perf_counter()}
+
+    def _kicked_off(inputs: Any) -> Any:
+        with lock:
+            clock["last"] = time.perf_counter()
+        return inputs
+
+    try:
+        crew.before_kickoff_callbacks.append(_kicked_off)
+    except Exception:  # noqa: BLE001 - progress reporting is not the run
+        pass
 
     def _callback(task_output: Any) -> None:
         nonlocal previous
@@ -412,12 +464,17 @@ def _attach_task_callback(crew: Any, record: Callable[..., None], *, model_id: s
             name = description.splitlines()[0][:120] if description else ""
         delta: _Counts | None = None
         with lock:
+            now = time.perf_counter()
+            latency_ms = int((now - clock["last"]) * 1000)
+            clock["last"] = now
             snapshot = _crew_usage_snapshot(crew)
             if snapshot is not None:
                 delta = snapshot.since(previous)
                 previous = snapshot
+        name = name or "task"
         record(
-            name or "task",
+            f"{prefix}.{name}" if prefix else name,
+            latency_ms=latency_ms,
             model_id=model_id,
             input_tokens=delta.prompt_tokens if delta is not None else None,
             output_tokens=delta.completion_tokens if delta is not None else None,
@@ -468,6 +525,15 @@ class _Counts:
     cache_write_tokens: int | None
     cache_read_tokens: int | None
 
+    def plus(self, other: _Counts) -> _Counts:
+        """Two crews' totals together; a cache count either one lacks is unknown."""
+        return _Counts(
+            prompt_tokens=self.prompt_tokens + other.prompt_tokens,
+            completion_tokens=self.completion_tokens + other.completion_tokens,
+            cache_write_tokens=_count_plus(self.cache_write_tokens, other.cache_write_tokens),
+            cache_read_tokens=_count_plus(self.cache_read_tokens, other.cache_read_tokens),
+        )
+
     def since(self, earlier: _Counts) -> _Counts:
         """What was spent between ``earlier`` and this reading, never below zero."""
         return _Counts(
@@ -476,6 +542,12 @@ class _Counts:
             cache_write_tokens=_count_since(self.cache_write_tokens, earlier.cache_write_tokens),
             cache_read_tokens=_count_since(self.cache_read_tokens, earlier.cache_read_tokens),
         )
+
+
+def _count_plus(one: int | None, other: int | None) -> int | None:
+    if one is None or other is None:
+        return None
+    return one + other
 
 
 def _count_since(now: int | None, earlier: int | None) -> int | None:
@@ -534,6 +606,23 @@ def _crew_usage_snapshot(crew: Any) -> _Counts | None:
     return _read_counts(usage)
 
 
+def _summed_counts(crews: list[Any]) -> _Counts | None:
+    """What every crew spent, together, or ``None`` if any could not say.
+
+    All or nothing: a crew whose totals cannot be read spent something
+    nobody knows, and a sum without it is a smaller number, not a known one.
+    """
+    if not crews:
+        return None
+    total = _Counts(prompt_tokens=0, completion_tokens=0, cache_write_tokens=0, cache_read_tokens=0)
+    for crew in crews:
+        counts = _crew_usage_snapshot(crew)
+        if counts is None:
+            return None
+        total = total.plus(counts)
+    return total
+
+
 def _attach_usage(outcome: RunOutcome, result: Any) -> None:
     """Copy crewai's token totals onto the outcome, when it reports them.
 
@@ -544,7 +633,12 @@ def _attach_usage(outcome: RunOutcome, result: Any) -> None:
     usage = getattr(result, "token_usage", None)
     if usage is None:
         return
-    counts = _read_counts(usage)
+    _attach_totals(outcome, _read_counts(usage))
+
+
+def _attach_totals(outcome: RunOutcome, counts: _Counts | None) -> None:
+    if counts is None:
+        return
     outcome.input_tokens = counts.prompt_tokens
     outcome.output_tokens = counts.completion_tokens
     outcome.cache_write_tokens = counts.cache_write_tokens
