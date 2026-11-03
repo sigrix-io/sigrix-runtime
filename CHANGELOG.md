@@ -6,6 +6,43 @@ described in `VERSIONING.md`.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-03
+
+A run reports what its tokens cost to price: the prompt cache's share of its
+input, and, for a workforce, every step and the run's totals. A crew's first
+step is timed from its kickoff. Nothing a client already reads changes shape.
+
+### Added
+
+- A run's `usage`, and each of its steps, reports how much of its input the
+  provider's prompt cache wrote and read: `cache_write_tokens` and
+  `cache_read_tokens`, under `org.sigrix`. A provider that caches prices the
+  three kinds of input apart (Anthropic charges a cache write at 1.25 times
+  its input rate and a cache read at a tenth of it), so a client pricing a run
+  needs the split. Both are counts inside `input_tokens`, which keeps its
+  meaning, and each is present only when CrewAI reported it. Postern's `usage`
+  has no member for them, so they ride under the namespace `files_written`
+  does, which a client that does not know it ignores. `cost_usd` is unchanged:
+  it still prices every input token at the model's input rate.
+- A workforce run reports what it spent. It reported no step and no usage
+  before, so a client pricing runs priced every workforce run at nothing.
+  Each task of each unit crew is a step named `<unit key>.<task>`, as
+  `describe` lists it, and each of the workforce's own crews is one too:
+  `workforce-manager.route`, `workforce-manager.answer` and
+  `workforce-synthesizer.synthesize`, a hyphen keeping them apart from any
+  unit's. Every step carries its tokens and its cache split, is timed on its
+  own crew's clock (a panel runs its units at once), and streams as it
+  finishes. The run's `usage` is every crew's totals summed, and is left out,
+  never short, when a crew cannot say what it spent. Its `model_id`, and so its
+  `cost_usd`, is the model the crews resolved, as a single crew's is.
+
+### Fixed
+
+- A crew's first step reported, as its `latency_ms`, the time the runner
+  spent loading the bundle's configuration, importing CrewAI and building the
+  crew as well as the task's own. SPEC 4.3 defines a step's latency as its own
+  elapsed time, so each crew is now timed from its own kickoff.
+
 ### Changed
 
 - The README opens with badges for the PyPI release, the Python versions, CI

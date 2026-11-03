@@ -37,6 +37,14 @@ from sigrix_runtime.postern import server as server_module  # noqa: E402
 from sigrix_runtime.postern.engine import Limits  # noqa: E402
 from sigrix_runtime.postern.server import PosternServer, Runner, RunnerConfig  # noqa: E402
 from tests import postern_schema  # noqa: E402
+from tests.claude_stand_in import (
+    INPUT_PER_CALL,
+    MODEL_ID,
+    OUTPUT_PER_CALL,
+    READ_PER_CALL,
+    WRITTEN_PER_CALL,
+    claude_on_loopback,
+)
 from tests.support import BUNDLE_VERSION, CREW_CONFIG, RUNTIME_ROOT
 
 # A crew whose members never call a model. ``kickoff`` fires the crew's own
@@ -53,6 +61,13 @@ _CREWAI_STUB = """
 import os as _os
 
 _TASK_TOKEN_DELTAS = [(2000, 400), (1500, 350), (710, 168)]
+
+# With STUB_CACHE_TOKENS set, the totals carry the two fields crewai keeps
+# beside its input count for a provider that caches, as its Anthropic one
+# does: how many of each task's input it wrote to the cache and read from it.
+# They are inside the input deltas above, never added to them.
+_CACHE = _os.environ.get("STUB_CACHE_TOKENS") == "1"
+_TASK_CACHE_DELTAS = [(1000, 0), (0, 900), (0, 300)]
 
 
 class Process:
@@ -82,6 +97,11 @@ class _Usage:
     completion_tokens = 918
 
 
+if _CACHE:
+    _Usage.cache_creation_tokens = 1000
+    _Usage.cached_prompt_tokens = 1200
+
+
 class _Output:
     token_usage = _Usage()
 
@@ -90,9 +110,12 @@ class _Output:
 
 
 class _RunningUsage:
-    def __init__(self, prompt_tokens, completion_tokens):
+    def __init__(self, prompt_tokens, completion_tokens, written, read):
         self.prompt_tokens = prompt_tokens
         self.completion_tokens = completion_tokens
+        if _CACHE:
+            self.cache_creation_tokens = written
+            self.cached_prompt_tokens = read
 
 
 class _TaskOutput:
@@ -112,10 +135,12 @@ class Crew:
         self.manager_agent = kwargs.get("manager_agent")
         self._prompt_tokens = 0
         self._completion_tokens = 0
+        self._written = 0
+        self._read = 0
         self._task_index = 0
 
     def calculate_usage_metrics(self):
-        return _RunningUsage(self._prompt_tokens, self._completion_tokens)
+        return _RunningUsage(self._prompt_tokens, self._completion_tokens, self._written, self._read)
 
     def kickoff(self, inputs=None):
         import json as _json
@@ -124,11 +149,30 @@ class Crew:
         _pathlib.Path("kickoff_inputs.json").write_text(_json.dumps(inputs or {}))
         for task in self.tasks:
             delta = _TASK_TOKEN_DELTAS[self._task_index % len(_TASK_TOKEN_DELTAS)]
+            cache = _TASK_CACHE_DELTAS[self._task_index % len(_TASK_CACHE_DELTAS)]
             self._task_index += 1
             self._prompt_tokens += delta[0]
             self._completion_tokens += delta[1]
+            self._written += cache[0]
+            self._read += cache[1]
             if self.task_callback:
                 self.task_callback(_TaskOutput(task))
+            # With STUB_STEP_GATE naming a folder, the first task's step is out
+            # before the second task starts: the second waits for the test to
+            # say it has read that step, and says when it starts.
+            gate = _os.environ.get("STUB_STEP_GATE")
+            if gate and self._task_index == 1:
+                import time as _gate_time
+
+                go = _pathlib.Path(gate, "go")
+                for _ in range(2000):
+                    if go.exists():
+                        break
+                    _gate_time.sleep(0.01)
+                else:
+                    raise RuntimeError("nobody read the first step")
+            if gate:
+                _pathlib.Path(gate, f"started-{self._task_index}").write_text("")
         return _Output()
 """
 
@@ -154,9 +198,15 @@ class _Client:
         self.port = port
 
     def request(
-        self, method: str, path: str, *, body: bytes | None = None, headers: dict[str, str] | None = None
+        self,
+        method: str,
+        path: str,
+        *,
+        body: bytes | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: float = 30,
     ) -> tuple[int, dict[str, str], bytes]:
-        connection = HTTPConnection("127.0.0.1", self.port, timeout=30)
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=timeout)
         try:
             connection.request(method, PATH_PREFIX + path, body=body, headers=headers or {})
             response = connection.getresponse()
@@ -306,6 +356,138 @@ def test_a_run_on_an_unpriced_model_omits_cost_usd_rather_than_zeroing_it(
     assert body["usage"]["input_tokens"] == 4210
     assert "cost_usd" not in body["usage"]
     assert all(step["model_id"] == "gpt-4.1-mini" for step in body["usage"]["steps"])
+
+
+def test_a_run_reports_its_cache_writes_and_reads_beside_the_totals(
+    bundle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The run's split, and each step's share of it, under ``org.sigrix``.
+
+    A provider that caches prices the three kinds of input apart, Anthropic a
+    cache write at 1.25 times its input rate and a read at a tenth of it, so
+    a client that prices a run needs to know how much of ``input_tokens`` each
+    was. They are counted inside ``input_tokens``, which keeps its meaning.
+    """
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("STUB_CACHE_TOKENS", "1")
+    with _serve(bundle) as client:
+        status, body = client.json("POST", "/run", {"inputs": {"prompt": "review this"}})
+    assert status == 200
+    postern_schema.validate(body, postern_schema.load("run-response"), name="run")
+    usage = body["usage"]
+    assert usage["input_tokens"] == 4210
+    assert usage["org.sigrix"] == {"cache_write_tokens": 1000, "cache_read_tokens": 1200}
+    shares = [step["org.sigrix"] for step in usage["steps"]]
+    assert shares == [
+        {"cache_write_tokens": 1000, "cache_read_tokens": 0},
+        {"cache_write_tokens": 0, "cache_read_tokens": 900},
+        {"cache_write_tokens": 0, "cache_read_tokens": 300},
+    ]
+    assert sum(share["cache_write_tokens"] for share in shares) == usage["org.sigrix"]["cache_write_tokens"]
+    assert sum(share["cache_read_tokens"] for share in shares) == usage["org.sigrix"]["cache_read_tokens"]
+    assert not {"cache_write_tokens", "cache_read_tokens"} & set(usage), "a member Postern does not define"
+
+
+def test_a_streamed_step_carries_its_cache_split_as_it_happens(bundle: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """What a client watching the stream prices before the run ends."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("STUB_CACHE_TOKENS", "1")
+    body = json.dumps({"inputs": {"prompt": "go"}}).encode("utf-8")
+    with _serve(bundle) as client:
+        _, _, raw = client.request(
+            "POST",
+            "/stream",
+            body=body,
+            headers={"Content-Type": "application/json", "Content-Length": str(len(body))},
+        )
+    events = _events(raw)
+    steps = [payload for name, payload in events if name == "step"]
+    schema = postern_schema.load("stream-event")
+    for step in steps:
+        postern_schema.validate(step, schema, name="step")
+    assert [step["org.sigrix"]["cache_read_tokens"] for step in steps] == [0, 900, 300]
+    assert dict(events)["done"]["usage"]["org.sigrix"] == {"cache_write_tokens": 1000, "cache_read_tokens": 1200}
+
+
+def test_a_step_is_streamed_before_the_next_task_starts(bundle: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A client that prices each step can stop a run before its next task spends anything.
+
+    The second task waits until the test has read the first task's step, so a
+    runner that held its steps back until the run ended would never send it:
+    the read times out and the test fails.
+    """
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    gate = bundle.parent / "gate"
+    gate.mkdir()
+    monkeypatch.setenv("STUB_STEP_GATE", str(gate))
+    body = json.dumps({"inputs": {"prompt": "go"}}).encode("utf-8")
+    with _serve(bundle) as client:
+        connection = HTTPConnection("127.0.0.1", client.port, timeout=15)
+        try:
+            connection.request(
+                "POST",
+                PATH_PREFIX + "/stream",
+                body=body,
+                headers={"Content-Type": "application/json", "Content-Length": str(len(body))},
+            )
+            response = connection.getresponse()
+            assert response.status == 200
+            names = []
+            for line in iter(response.readline, b""):
+                if line.startswith(b"event: "):
+                    names.append(line[len(b"event: ") :].strip().decode())
+                    if names.count("step") == 1 and names[-1] == "step":
+                        assert not (gate / "started-1").exists(), "the second task started before its step was read"
+                        (gate / "go").write_text("", encoding="utf-8")
+        finally:
+            connection.close()
+    assert names == ["start", "step", "step", "step", "done"]
+
+
+def test_a_run_whose_crewai_reports_no_cache_fields_carries_no_split(client: _Client) -> None:
+    """Absent, never a zero: a zero would say the provider cached nothing."""
+    status, body = client.json("POST", "/run", {"inputs": {"prompt": "review this"}})
+    assert status == 200
+    assert "org.sigrix" not in body["usage"]
+    assert all("org.sigrix" not in step for step in body["usage"]["steps"])
+
+
+def test_a_real_crew_on_claude_reports_the_cache_split_its_provider_measured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fields read, against crewai itself rather than a stand-in for it.
+
+    The stub crewai above carries the field names this module reads, so it
+    would agree with a misspelling. Here the crew is crewai's own, on its own
+    Anthropic provider, and only Anthropic's API is a stand-in: so this is what
+    fails if crewai renames ``cache_creation_tokens`` or ``cached_prompt_tokens``
+    or stops counting the cache inside ``prompt_tokens``. It needs crewai's
+    ``anthropic`` extra, which the floor job installs.
+    """
+    root = tmp_path / "bundle"
+    shutil.copytree(RUNTIME_ROOT, root)
+    shutil.copytree(CREW_CONFIG, root / "config", dirs_exist_ok=True)
+    (root / "VERSION").write_text(BUNDLE_VERSION, encoding="utf-8")
+
+    with claude_on_loopback(monkeypatch, tmp_path / "home") as claude, _serve(root) as client:
+        status, body = client.json("POST", "/run", {"inputs": {"prompt": "review this"}}, timeout=240)
+        calls = claude.messages
+
+    assert status == 200, body
+    assert calls >= 3, "a three-task crew made fewer model calls than tasks"
+    postern_schema.validate(body, postern_schema.load("run-response"), name="run")
+    usage = body["usage"]
+    # crewai counts the cache inside the input, and the runner keeps that meaning.
+    assert (usage["input_tokens"], usage["output_tokens"]) == (INPUT_PER_CALL * calls, OUTPUT_PER_CALL * calls)
+    assert usage["org.sigrix"] == {
+        "cache_write_tokens": WRITTEN_PER_CALL * calls,
+        "cache_read_tokens": READ_PER_CALL * calls,
+    }
+    steps = usage["steps"]
+    assert [step["name"] for step in steps] == ["summarise_contract", "identify_risks", "draft_negotiation_play"]
+    assert sum(step["org.sigrix"]["cache_write_tokens"] for step in steps) == WRITTEN_PER_CALL * calls
+    assert sum(step["org.sigrix"]["cache_read_tokens"] for step in steps) == READ_PER_CALL * calls
+    assert all(step["model_id"] == MODEL_ID for step in steps), [step.get("model_id") for step in steps]
 
 
 def test_the_run_body_carries_no_status_member(client: _Client) -> None:

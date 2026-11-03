@@ -105,6 +105,9 @@ def main() -> int:
             "steps": [step.as_dict() for step in outcome.steps],
             "input_tokens": outcome.input_tokens,
             "output_tokens": outcome.output_tokens,
+            # Shaped here, where a step's own split is, so the engine places
+            # the run's under the namespace without naming a member itself.
+            "cache": execution.cache_split(outcome.cache_write_tokens, outcome.cache_read_tokens),
             "model_id": outcome.model_id,
             "duration_seconds": outcome.duration_seconds,
         }

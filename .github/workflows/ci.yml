@@ -49,15 +49,18 @@ jobs:
       - run: python -m pytest
 
   # A floor nobody tests is a guess. The crewai extra declares 1.15.20 as its
-  # floor, and the three tests that build a real crew skip without CrewAI, so
-  # something has to install that floor and run them.
+  # floor, and the tests that build a real crew skip without CrewAI, so
+  # something has to install that floor and run them. CrewAI's own `anthropic`
+  # extra comes with it for the one that runs a crew on Claude's provider: the
+  # cache counts a run reports are read off CrewAI's, and only a real CrewAI
+  # can say the names read are the names it writes.
   crewai-floor:
     runs-on: ubuntu-latest
     steps:
       - uses: sigrix-io/actions/setup-python-project@765103f1c9d89e019dcaea72a78eed2577b30ae1 # v1.0.0
         with:
           python-version: "3.12"
-          install: -e .[dev,crewai] crewai==1.15.20 crewai-tools==1.15.20
+          install: -e .[dev,crewai] crewai[anthropic]==1.15.20 crewai-tools==1.15.20
       - run: python -m pytest
 
   # The specification's own checker, against this runner rather than a stand-in:

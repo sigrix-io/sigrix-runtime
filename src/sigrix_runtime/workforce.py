@@ -26,6 +26,7 @@ the run path.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -44,6 +45,19 @@ DEFAULT_MANAGER_ROLE = "Workforce Manager"
 # The router's "no unit owns this" sentinel; kept lowercase-simple so the
 # reply parse stays robust across models.
 NO_UNIT_SENTINEL = "none"
+
+# What the steps of the workforce's own crews go under, beside each unit's key:
+# the manager that routes a request and answers one no unit owns, and the
+# synthesizer that joins a panel's answers. Those crews are the runtime's, not a
+# seller's, and each runs one named task. A hyphen is outside the unit-key
+# grammar ``parse_manifest`` holds keys to, so no unit's step can share a name.
+MANAGER_STEP_PREFIX = "workforce-manager"
+SYNTHESIZER_STEP_PREFIX = "workforce-synthesizer"
+
+#: Called with every crew a workforce builds, and the name its steps go under,
+#: before that crew runs: what lets a caller hear each task finish and count
+#: what the whole workforce spent, which a Flow's own answer does not carry.
+CrewHook = Callable[[Any, str], None]
 
 
 class WorkforceConfigError(ValueError):
@@ -183,19 +197,42 @@ def load_workforce(config_dir: Path) -> WorkforceConfig | None:
 # ---------------------------------------------------------------------------
 
 
-def run_workforce(config: WorkforceConfig, *, prompt: str, workspace: Path, configuration: str = "") -> str:
-    """Run the workforce against *prompt* and return the final answer text."""
-    flow = build_workforce_flow(config, prompt=prompt, workspace=workspace, configuration=configuration)
+def run_workforce(
+    config: WorkforceConfig,
+    *,
+    prompt: str,
+    workspace: Path,
+    configuration: str = "",
+    on_crew: CrewHook | None = None,
+) -> str:
+    """Run the workforce against *prompt* and return the final answer text.
+
+    ``on_crew`` is handed every crew the run builds, as :data:`CrewHook` says.
+    """
+    flow = build_workforce_flow(
+        config, prompt=prompt, workspace=workspace, configuration=configuration, on_crew=on_crew
+    )
     return _output_text(flow.kickoff())
 
 
-def build_workforce_flow(config: WorkforceConfig, *, prompt: str, workspace: Path, configuration: str = "") -> Any:
+def build_workforce_flow(
+    config: WorkforceConfig,
+    *,
+    prompt: str,
+    workspace: Path,
+    configuration: str = "",
+    on_crew: CrewHook | None = None,
+) -> Any:
     """Construct the per-mode Flow over the unit crews (crewai imported here).
 
     ``configuration`` is the buyer's setup block, passed to every unit
     crew beside the brief so a unit task carrying the ``{configuration}`` slot
     resolves it. It defaults to ``""`` so a bundle predating the bridge — and
     every caller that has nothing to pass — runs exactly as before.
+
+    ``on_crew`` meets each unit crew here, under its unit's key, and each crew
+    of the workforce's own as the Flow builds it, under
+    :data:`MANAGER_STEP_PREFIX` or :data:`SYNTHESIZER_STEP_PREFIX`.
     """
     from sigrix_runtime.quiet import apply_quiet_env_defaults
 
@@ -206,14 +243,17 @@ def build_workforce_flow(config: WorkforceConfig, *, prompt: str, workspace: Pat
         if unit.config is None:
             raise WorkforceConfigError(f"unit {unit.key!r} has no loaded config")
         tools = sandbox.build_tools(unit.config.tool_refs, workspace=workspace)
-        unit_crews.append((unit, loader.build_crew(unit.config, tools)))
+        crew = loader.build_crew(unit.config, tools)
+        if on_crew is not None:
+            on_crew(crew, unit.key)
+        unit_crews.append((unit, crew))
 
     flow_cls = {
         "sequential": PipelineWorkforceFlow,
         "parallel": PanelWorkforceFlow,
         "hierarchical": RouteWorkforceFlow,
     }[config.process]
-    return flow_cls(config=config, unit_crews=unit_crews, prompt=prompt, configuration=configuration)
+    return flow_cls(config=config, unit_crews=unit_crews, prompt=prompt, configuration=configuration, on_crew=on_crew)
 
 
 def _output_text(result: Any) -> str:
@@ -240,13 +280,29 @@ def _handoff_lines(config: WorkforceConfig) -> str:
     return "\n".join(lines)
 
 
-def _single_agent_answer(*, role: str, goal: str, backstory: str, description: str, expected_output: str) -> str:
-    """One agent, one task, one answer — the runtime's helper-crew shape."""
+def _single_agent_answer(
+    *,
+    name: str,
+    step_prefix: str,
+    role: str,
+    goal: str,
+    backstory: str,
+    description: str,
+    expected_output: str,
+    on_crew: CrewHook | None = None,
+) -> str:
+    """One agent, one task, one answer — the runtime's helper-crew shape.
+
+    The task is named, so its step reads ``<step_prefix>.<name>`` rather than
+    the first line of a description written for the model.
+    """
     from crewai import Agent, Crew, Process, Task
 
     agent = Agent(role=role, goal=goal, backstory=backstory, verbose=False)
-    task = Task(description=description, expected_output=expected_output, agent=agent)
+    task = Task(name=name, description=description, expected_output=expected_output, agent=agent)
     crew = Crew(agents=[agent], tasks=[task], process=Process.sequential, verbose=False)
+    if on_crew is not None:
+        on_crew(crew, step_prefix)
     return _output_text(crew.kickoff())
 
 
@@ -290,13 +346,20 @@ class _WorkforceFlowFactory:
                 """Units chain: each builds on the previous unit's output."""
 
                 def __init__(
-                    self, *, config: WorkforceConfig, unit_crews: list[Any], prompt: str, configuration: str = ""
+                    self,
+                    *,
+                    config: WorkforceConfig,
+                    unit_crews: list[Any],
+                    prompt: str,
+                    configuration: str = "",
+                    on_crew: CrewHook | None = None,
                 ) -> None:
                     super().__init__()
                     self._config = config
                     self._unit_crews = unit_crews
                     self._prompt = prompt
                     self._configuration = configuration
+                    self._on_crew = on_crew
 
                 @start()
                 def run_pipeline(self) -> str:
@@ -324,13 +387,20 @@ class _WorkforceFlowFactory:
                 """Units answer concurrently; a synthesizer joins the panel."""
 
                 def __init__(
-                    self, *, config: WorkforceConfig, unit_crews: list[Any], prompt: str, configuration: str = ""
+                    self,
+                    *,
+                    config: WorkforceConfig,
+                    unit_crews: list[Any],
+                    prompt: str,
+                    configuration: str = "",
+                    on_crew: CrewHook | None = None,
                 ) -> None:
                     super().__init__()
                     self._config = config
                     self._unit_crews = unit_crews
                     self._prompt = prompt
                     self._configuration = configuration
+                    self._on_crew = on_crew
 
                 @start()
                 async def fan_out(self) -> list[str]:
@@ -350,6 +420,9 @@ class _WorkforceFlowFactory:
                         sections.append(f"## {header}\n\n{answer}")
                     role = self._config.synthesizer or DEFAULT_SYNTHESIZER_ROLE
                     return _single_agent_answer(
+                        name="synthesize",
+                        step_prefix=SYNTHESIZER_STEP_PREFIX,
+                        on_crew=self._on_crew,
                         role=role,
                         goal=(
                             "Chair a panel of unit crews: every unit has answered the user's request "
@@ -375,13 +448,20 @@ class _WorkforceFlowFactory:
                 """A manager step classifies the request and dispatches the owning unit crew."""
 
                 def __init__(
-                    self, *, config: WorkforceConfig, unit_crews: list[Any], prompt: str, configuration: str = ""
+                    self,
+                    *,
+                    config: WorkforceConfig,
+                    unit_crews: list[Any],
+                    prompt: str,
+                    configuration: str = "",
+                    on_crew: CrewHook | None = None,
                 ) -> None:
                     super().__init__()
                     self._config = config
                     self._unit_crews = unit_crews
                     self._prompt = prompt
                     self._configuration = configuration
+                    self._on_crew = on_crew
 
                 @start()
                 def classify(self) -> str:
@@ -395,6 +475,9 @@ class _WorkforceFlowFactory:
                         f"If no unit clearly owns it, reply exactly: {NO_UNIT_SENTINEL}"
                     )
                     reply = _single_agent_answer(
+                        name="route",
+                        step_prefix=MANAGER_STEP_PREFIX,
+                        on_crew=self._on_crew,
                         role=DEFAULT_MANAGER_ROLE,
                         goal=("Run an AI workforce of specialist crews: route each request to the unit that owns it."),
                         backstory=_org_chart_lines(self._config),
@@ -416,6 +499,9 @@ class _WorkforceFlowFactory:
                         "Answer helpfully and note which units of the workforce could help with follow-ups."
                     )
                     return _single_agent_answer(
+                        name="answer",
+                        step_prefix=MANAGER_STEP_PREFIX,
+                        on_crew=self._on_crew,
                         role=DEFAULT_MANAGER_ROLE,
                         goal="Cover requests no unit clearly owns, in the workforce's voice.",
                         backstory=_org_chart_lines(self._config),

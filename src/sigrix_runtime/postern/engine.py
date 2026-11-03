@@ -421,6 +421,13 @@ def _usage(done: dict[str, Any], steps: list[dict[str, Any]]) -> dict[str, Any]:
     if input_tokens or output_tokens:
         usage["input_tokens"] = input_tokens
         usage["output_tokens"] = output_tokens
+        # How many of ``input_tokens`` the provider wrote to its prompt cache
+        # and read from it, as each step carries its own. Postern's ``usage``
+        # has no member for them, so they ride under the namespace the body's
+        # ``files_written`` does, which a client that does not know it ignores.
+        cache = done.get("cache")
+        if isinstance(cache, dict) and cache:
+            usage["org.sigrix"] = dict(cache)
         cost = estimate_cost(str(done.get("model_id") or ""), input_tokens, output_tokens)
         if cost is not None:
             usage["cost_usd"] = cost
