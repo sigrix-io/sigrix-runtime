@@ -65,6 +65,12 @@ PROMPT_INPUT_KEY = "prompt"
 # since ``execute()`` builds no crew there this module can introspect.
 MODEL_ENV_KEY = "OPENAI_MODEL_NAME"
 
+# Where a step carries what Postern's ``usage`` has no member for. Unknown
+# members are ignored by every conforming client, and a reverse-domain name
+# is what keeps this one from colliding with a member the specification may
+# add later: the same namespace the run body's ``files_written`` rides under.
+SIGRIX_MEMBER = "org.sigrix"
+
 
 class MissingDependencyError(RuntimeError):
     """The bundle's requirements are not installed in this Python.
@@ -89,6 +95,14 @@ class RunStep:
     run never determined a value, where ``0`` would claim the step spent
     nothing. A crew whose usage this module could read reports real
     (possibly zero) numbers; one it could not says nothing at all.
+
+    ``cache_write_tokens``/``cache_read_tokens`` say how many of
+    ``input_tokens`` the provider wrote to its prompt cache and read back from
+    it. They are part of ``input_tokens``, not added to it, and they are priced
+    apart from the rest: Anthropic charges a cache write at 1.25 times its
+    input rate and a cache read at a tenth of it. Postern's ``usage`` has no
+    member for either, so they ride under :data:`SIGRIX_MEMBER`, and only when
+    crewai reported them.
     """
 
     name: str
@@ -96,6 +110,8 @@ class RunStep:
     model_id: str = ""
     input_tokens: int | None = None
     output_tokens: int | None = None
+    cache_write_tokens: int | None = None
+    cache_read_tokens: int | None = None
 
     def as_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {"name": self.name, "latency_ms": self.latency_ms}
@@ -105,18 +121,27 @@ class RunStep:
             payload["input_tokens"] = self.input_tokens
         if self.output_tokens is not None:
             payload["output_tokens"] = self.output_tokens
+        cache = cache_split(self.cache_write_tokens, self.cache_read_tokens)
+        if cache:
+            payload[SIGRIX_MEMBER] = cache
         return payload
 
 
 @dataclass
 class RunOutcome:
-    """What a completed run produced, before any front end renders it."""
+    """What a completed run produced, before any front end renders it.
+
+    The cache counts are the run's totals, read as :class:`RunStep` reads them
+    for one step, and ``None`` when crewai did not report them.
+    """
 
     text: str
     files_written: list[str] = field(default_factory=list)
     steps: list[RunStep] = field(default_factory=list)
     input_tokens: int = 0
     output_tokens: int = 0
+    cache_write_tokens: int | None = None
+    cache_read_tokens: int | None = None
     model_id: str = ""
     duration_seconds: float = 0.0
     # True when the bundle carried a workforce.yaml manifest and it loaded.
@@ -257,7 +282,13 @@ def execute(
     step_clock = {"last": time.perf_counter()}
 
     def _record(
-        name: str, *, model_id: str = "", input_tokens: int | None = None, output_tokens: int | None = None
+        name: str,
+        *,
+        model_id: str = "",
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        cache_write_tokens: int | None = None,
+        cache_read_tokens: int | None = None,
     ) -> None:
         now = time.perf_counter()
         step = RunStep(
@@ -266,6 +297,8 @@ def execute(
             model_id=model_id,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            cache_write_tokens=cache_write_tokens,
+            cache_read_tokens=cache_read_tokens,
         )
         step_clock["last"] = now
         steps.append(step)
@@ -357,11 +390,15 @@ def _attach_task_callback(crew: Any, record: Callable[..., None], *, model_id: s
     when one step's does not. The lock keeps the running-total bookkeeping
     itself race-free — a plain read-then-write here would double-count or
     drop tokens under exactly that concurrency.
+
+    The cache counts are deltas of crewai's own running totals in the same
+    way, and stay ``None`` for a crewai whose totals do not carry them.
     """
     lock = threading.Lock()
-    previous = {"prompt_tokens": 0, "completion_tokens": 0}
+    previous = _Counts(prompt_tokens=0, completion_tokens=0, cache_write_tokens=0, cache_read_tokens=0)
 
     def _callback(task_output: Any) -> None:
+        nonlocal previous
         # The task's own name is never truncated: it is the task's identity,
         # and a short YAML key, not prose. Only the
         # fallback needs a bound: a task with no ``name=`` reports none on
@@ -373,17 +410,20 @@ def _attach_task_callback(crew: Any, record: Callable[..., None], *, model_id: s
         if not name:
             description = str(getattr(task_output, "description", "") or "").strip()
             name = description.splitlines()[0][:120] if description else ""
-        input_tokens: int | None = None
-        output_tokens: int | None = None
+        delta: _Counts | None = None
         with lock:
             snapshot = _crew_usage_snapshot(crew)
             if snapshot is not None:
-                prompt_total, completion_total = snapshot
-                input_tokens = max(0, prompt_total - previous["prompt_tokens"])
-                output_tokens = max(0, completion_total - previous["completion_tokens"])
-                previous["prompt_tokens"] = prompt_total
-                previous["completion_tokens"] = completion_total
-        record(name or "task", model_id=model_id, input_tokens=input_tokens, output_tokens=output_tokens)
+                delta = snapshot.since(previous)
+                previous = snapshot
+        record(
+            name or "task",
+            model_id=model_id,
+            input_tokens=delta.prompt_tokens if delta is not None else None,
+            output_tokens=delta.completion_tokens if delta is not None else None,
+            cache_write_tokens=delta.cache_write_tokens if delta is not None else None,
+            cache_read_tokens=delta.cache_read_tokens if delta is not None else None,
+        )
 
     try:
         crew.task_callback = _callback
@@ -411,8 +451,74 @@ def _resolved_model_id(crew: Any) -> str:
     return ""
 
 
-def _crew_usage_snapshot(crew: Any) -> tuple[int, int] | None:
-    """``(prompt_tokens, completion_tokens)`` right now, cumulative, or ``None``.
+@dataclass(frozen=True)
+class _Counts:
+    """One reading of crewai's token totals, a crew's running ones or a run's.
+
+    crewai counts every input token in ``prompt_tokens``, cached or not: its
+    Anthropic provider adds the cache writes and the cache reads into the
+    input it reports, and keeps each beside it, as ``cache_creation_tokens``
+    and ``cached_prompt_tokens`` (both on ``UsageMetrics`` since this extra's
+    floor, 1.15.20). A cache count is ``None`` when the reading has no such
+    field, which says nothing, where a zero says no cache was used.
+    """
+
+    prompt_tokens: int
+    completion_tokens: int
+    cache_write_tokens: int | None
+    cache_read_tokens: int | None
+
+    def since(self, earlier: _Counts) -> _Counts:
+        """What was spent between ``earlier`` and this reading, never below zero."""
+        return _Counts(
+            prompt_tokens=max(0, self.prompt_tokens - earlier.prompt_tokens),
+            completion_tokens=max(0, self.completion_tokens - earlier.completion_tokens),
+            cache_write_tokens=_count_since(self.cache_write_tokens, earlier.cache_write_tokens),
+            cache_read_tokens=_count_since(self.cache_read_tokens, earlier.cache_read_tokens),
+        )
+
+
+def _count_since(now: int | None, earlier: int | None) -> int | None:
+    if now is None:
+        return None
+    return max(0, now - (earlier or 0))
+
+
+def _optional_count(usage: Any, name: str) -> int | None:
+    value = getattr(usage, name, None)
+    if value is None:
+        return None
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _read_counts(usage: Any) -> _Counts:
+    return _Counts(
+        prompt_tokens=int(getattr(usage, "prompt_tokens", 0) or 0),
+        completion_tokens=int(getattr(usage, "completion_tokens", 0) or 0),
+        cache_write_tokens=_optional_count(usage, "cache_creation_tokens"),
+        cache_read_tokens=_optional_count(usage, "cached_prompt_tokens"),
+    )
+
+
+def cache_split(cache_write_tokens: int | None, cache_read_tokens: int | None) -> dict[str, int]:
+    """The members a step, or a run's ``usage``, carries under :data:`SIGRIX_MEMBER`.
+
+    Each count that was reported, and none that was not. An empty answer
+    leaves the namespace out, rather than writing a zero nobody measured.
+    """
+    split: dict[str, int] = {}
+    if cache_write_tokens is not None:
+        split["cache_write_tokens"] = cache_write_tokens
+    if cache_read_tokens is not None:
+        split["cache_read_tokens"] = cache_read_tokens
+    return split
+
+
+def _crew_usage_snapshot(crew: Any) -> _Counts | None:
+    """The crew's token totals right now, cumulative, or ``None``.
 
     ``calculate_usage_metrics`` is the same method ``kickoff()`` calls at the
     end to populate its own result; calling it mid-run just re-reads each
@@ -425,7 +531,7 @@ def _crew_usage_snapshot(crew: Any) -> tuple[int, int] | None:
         return None
     if usage is None:
         return None
-    return int(getattr(usage, "prompt_tokens", 0) or 0), int(getattr(usage, "completion_tokens", 0) or 0)
+    return _read_counts(usage)
 
 
 def _attach_usage(outcome: RunOutcome, result: Any) -> None:
@@ -438,8 +544,11 @@ def _attach_usage(outcome: RunOutcome, result: Any) -> None:
     usage = getattr(result, "token_usage", None)
     if usage is None:
         return
-    outcome.input_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
-    outcome.output_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+    counts = _read_counts(usage)
+    outcome.input_tokens = counts.prompt_tokens
+    outcome.output_tokens = counts.completion_tokens
+    outcome.cache_write_tokens = counts.cache_write_tokens
+    outcome.cache_read_tokens = counts.cache_read_tokens
 
 
 def _workspace_files(workspace: Path) -> set[str]:
@@ -456,6 +565,8 @@ __all__ = [
     "RunOutcome",
     "RUNNER_ENV_PREFIXES",
     "RunStep",
+    "SIGRIX_MEMBER",
+    "cache_split",
     "drop_runner_settings",
     "execute",
     "is_runner_setting",

@@ -6,6 +6,19 @@ described in `VERSIONING.md`.
 
 ## [Unreleased]
 
+### Added
+
+- A run's `usage`, and each of its steps, reports how much of its input the
+  provider's prompt cache wrote and read: `cache_write_tokens` and
+  `cache_read_tokens`, under `org.sigrix`. A provider that caches prices the
+  three kinds of input apart (Anthropic charges a cache write at 1.25 times
+  its input rate and a cache read at a tenth of it), so a client pricing a run
+  needs the split. Both are counts inside `input_tokens`, which keeps its
+  meaning, and each is present only when CrewAI reported it. Postern's `usage`
+  has no member for them, so they ride under the namespace `files_written`
+  does, which a client that does not know it ignores. `cost_usd` is unchanged:
+  it still prices every input token at the model's input rate.
+
 ### Changed
 
 - The README opens with badges for the PyPI release, the Python versions, CI

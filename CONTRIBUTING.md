@@ -33,8 +33,10 @@ ruff check . && ruff format --check . && mypy && pytest
 ```
 
 The tests run a distributor and an MCP server on loopback, so they need no
-network. Three need CrewAI and skip without it; `pip install -e ".[dev,crewai]"`
-runs them too.
+network. The ones that build a real crew skip without CrewAI, and
+`pip install -e ".[dev,crewai]"` runs them. Those that run a crew on CrewAI's
+own Anthropic provider, against a stand-in for Anthropic's API, need its extra
+too: `pip install "crewai[anthropic]"`.
 
 To check conformance the way CI does, start the runner in MCP mode against the
 test server and point the checker at it:
