@@ -6,6 +6,12 @@ described in `VERSIONING.md`.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-03
+
+A run reports what its tokens cost to price: the prompt cache's share of its
+input, and, for a workforce, every step and the run's totals. A crew's first
+step is timed from its kickoff. Nothing a client already reads changes shape.
+
 ### Added
 
 - A run's `usage`, and each of its steps, reports how much of its input the
