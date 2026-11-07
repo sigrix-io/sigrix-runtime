@@ -6,6 +6,29 @@ described in `VERSIONING.md`.
 
 ## [Unreleased]
 
+### Added
+
+- A stream reports what its run has spent after every model call the run
+  makes, as an event named `org.sigrix.usage`. Its payload is the run's
+  totals so far, in the shape of a run's `usage` without its steps or
+  estimated cost: `input_tokens`, `output_tokens`, the cache split under
+  `org.sigrix`, and the `model_id` they were spent on. A step reports its
+  tokens only once its task has finished, so a client pricing a run as it
+  went, or stopping it at a budget, heard nothing of a task until its end, and
+  a run cut off inside a task said nothing of that task at all. SPEC 4.3 has a
+  client skip an event name it does not recognise, so a client that does not
+  know this one reads the stream as before, and the namespace keeps the name
+  clear of any the specification may define. What a `step` is does not
+  change. The readings come from CrewAI's own event bus, for the run alone,
+  and a workforce's sum every crew, or are left out while a crew cannot say
+  what it spent.
+- The `error` a run ends with carries what the run had spent when it ended,
+  under `detail`, in `org.sigrix`, as `usage`, beside whatever `detail`
+  already says (a timeout's `max_run_seconds`). A run stopped at its time
+  limit, or one that failed or stopped without a result, now says what it
+  spent, on `run` and `stream` alike. An `error` whose `detail` is a sentence
+  keeps it as it is.
+
 ## [0.2.0] - 2026-11-03
 
 A run reports what its tokens cost to price: the prompt cache's share of its

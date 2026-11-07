@@ -11,12 +11,18 @@ the releases that preflight, and that answer is not usage.
 A workforce's router asks its manager which unit owns a request; the stand-in
 answers that question with the unit it was told to route to, so a dispatch
 runs as it would against a model that chose.
+
+Told to ``hang_after`` a number of messages, it answers that many and holds
+every later one open, unanswered, until the test is over: a model call that
+never returns, which is how a run is cut off inside a task. Told an
+``answer_delay``, it waits that long before each answer, as a model takes time.
 """
 
 from __future__ import annotations
 
 import json
 import threading
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -55,7 +61,14 @@ class _Handler(BaseHTTPRequestHandler):
             self._answer({"input_tokens": INPUT_PER_CALL})
             return
         with server.lock:
-            server.messages += 1
+            hang = server.hang_after is not None and server.messages >= server.hang_after
+            if not hang:
+                server.messages += 1
+        if hang:
+            server.released.wait(timeout=120)
+            return
+        if server.answer_delay:
+            time.sleep(server.answer_delay)
         text = server.route_to if ROUTE_QUESTION in json.dumps(request) else "The work is done."
         reply = _ANSWER.format(text=text)
         model = request.get("model") or "unknown"
@@ -135,7 +148,14 @@ class StandIn:
 
 
 @contextmanager
-def claude_on_loopback(monkeypatch: pytest.MonkeyPatch, home: Path, *, route_to: str = "none") -> Iterator[StandIn]:
+def claude_on_loopback(
+    monkeypatch: pytest.MonkeyPatch,
+    home: Path,
+    *,
+    route_to: str = "none",
+    hang_after: int | None = None,
+    answer_delay: float = 0.0,
+) -> Iterator[StandIn]:
     """Serve the stand-in and point this process's environment at it.
 
     The runner hands a run this environment, so a crew it starts calls the
@@ -151,6 +171,9 @@ def claude_on_loopback(monkeypatch: pytest.MonkeyPatch, home: Path, *, route_to:
     server.messages = 0
     server.lock = threading.Lock()
     server.route_to = route_to
+    server.hang_after = hang_after
+    server.answer_delay = answer_delay
+    server.released = threading.Event()
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
         monkeypatch.setenv("ANTHROPIC_BASE_URL", f"http://127.0.0.1:{server.server_address[1]}")
@@ -169,5 +192,6 @@ def claude_on_loopback(monkeypatch: pytest.MonkeyPatch, home: Path, *, route_to:
         monkeypatch.setenv("XDG_DATA_HOME", str(home / ".local" / "share"))
         yield StandIn(server)
     finally:
+        server.released.set()
         server.shutdown()
         server.server_close()

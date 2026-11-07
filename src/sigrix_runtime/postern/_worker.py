@@ -6,8 +6,12 @@ and writes JSON Lines to stdout as it goes::
 
     {"event": "notice", "text": "…"}
     {"event": "step",   "name": "…", "latency_ms": 1234}
+    {"event": "usage",  "input_tokens": 1600, "output_tokens": 300, "cache": {...}}
     {"event": "done",   "text": "…", "files_written": [...], ...}
     {"event": "error",  "code": "agent_error", "message": "…"}
+
+A ``usage`` frame is what the run has spent so far, written after each model
+call it makes, so the engine knows what a run it stops inside a task had spent.
 
 **Why a process rather than a thread.** Three properties the server owes
 its clients are only obtainable by having something it can kill:
@@ -36,16 +40,24 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 import traceback
 from pathlib import Path
 from typing import Any
 
 from sigrix_runtime.postern.errors import requirements_not_installed
 
+#: Frames are written from more than one thread: a workforce's units finish on
+#: threads of their own, and crewai reports a finished model call from its own
+#: pool. One line half-written beside another is a frame the engine cannot read.
+_EMIT_LOCK = threading.Lock()
+
 
 def _emit(payload: dict[str, Any]) -> None:
-    sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
-    sys.stdout.flush()
+    line = json.dumps(payload, ensure_ascii=False) + "\n"
+    with _EMIT_LOCK:
+        sys.stdout.write(line)
+        sys.stdout.flush()
 
 
 def main() -> int:
@@ -81,6 +93,7 @@ def main() -> int:
             variables=variables,
             on_step=lambda step: _emit({"event": "step", **step.as_dict()}),
             on_notice=lambda note: _emit({"event": "notice", "text": note}),
+            on_usage=lambda usage: _emit({"event": "usage", **usage.as_frame()}),
         )
     except execution.MissingDependencyError as exc:
         # Not an agent failure: the agent never ran (see `requirements_not_installed`).

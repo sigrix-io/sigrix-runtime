@@ -33,7 +33,8 @@ import os
 import threading
 import time
 import traceback
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -124,6 +125,36 @@ class RunStep:
         cache = cache_split(self.cache_write_tokens, self.cache_read_tokens)
         if cache:
             payload[SIGRIX_MEMBER] = cache
+        return payload
+
+
+@dataclass(frozen=True)
+class RunUsage:
+    """What a run has spent so far, every model call it has made counted.
+
+    crewai's running totals, summed over every crew the run has built, read
+    after each model call rather than after each task. A step reports its
+    tokens only once its task finishes, so a run stopped inside a task (its
+    time limit, a cancel, a crash) reported nothing for that task; this is
+    what it had spent when it stopped. The cache counts are inside
+    ``input_tokens``, as a step's are, and ``None`` when crewai did not say.
+    """
+
+    input_tokens: int
+    output_tokens: int
+    cache_write_tokens: int | None = None
+    cache_read_tokens: int | None = None
+    model_id: str = ""
+
+    def as_frame(self) -> dict[str, Any]:
+        """The worker's frame: the cache split apart, for the engine to place as it places a run's."""
+        payload: dict[str, Any] = {
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "cache": cache_split(self.cache_write_tokens, self.cache_read_tokens),
+        }
+        if self.model_id:
+            payload["model_id"] = self.model_id
         return payload
 
 
@@ -235,6 +266,7 @@ def execute(
     variables: Mapping[str, Any] | None = None,
     on_step: Callable[[RunStep], None] | None = None,
     on_notice: Callable[[str], None] | None = None,
+    on_usage: Callable[[RunUsage], None] | None = None,
 ) -> RunOutcome:
     """Run the bundle against ``prompt`` and return what it produced.
 
@@ -255,6 +287,12 @@ def execute(
     ``on_notice`` receives the run's own asides — the setup values in play,
     a workforce manifest that failed to load — as plain sentences. The
     command line prints them to stderr; the server logs them.
+
+    ``on_usage`` is handed what the run has spent so far after every model
+    call it makes (:class:`RunUsage`), read off crewai's event bus. A step
+    says what its task spent only once the task finishes, so this is what a
+    run stopped inside a task had spent. A crewai without the bus reports at
+    each step alone, and the run is the same either way.
 
     Raises whatever the run raised, after writing the traceback to
     ``.last_error`` for ``doctor.py``.
@@ -281,31 +319,38 @@ def execute(
     steps = recorder.steps
     # Every crew a workforce builds, units and its own, for the run's totals.
     workforce_crews: list[Any] = []
+    usage = _UsageListener(on_usage, model_id=model_id) if on_usage is not None else None
 
     def _instrument(crew: Any, prefix: str) -> None:
         # A workforce's unit crews and its own, each reporting its tasks as a
         # single crew does, its steps named under its unit's key.
         workforce_crews.append(crew)
+        if usage is not None:
+            usage.watch(crew)
         _attach_task_callback(crew, recorder, model_id=_resolved_model_id(crew) or model_id, prefix=prefix)
 
     try:
         manifest, manifest_error = _load_workforce_manifest(bundle_root / "config")
-        if manifest is not None:
-            result = workforce.run_workforce(
-                manifest, prompt=prompt, workspace=workspace, configuration=config_block, on_crew=_instrument
-            )
-            model_id = next((m for m in map(_resolved_model_id, workforce_crews) if m), model_id)
-        else:
-            if manifest_error is not None and on_notice is not None:
-                on_notice(
-                    f"workforce.yaml could not be loaded ({manifest_error}); falling back to the flattened crew config."
+        with _reporting_usage(usage):
+            if manifest is not None:
+                result = workforce.run_workforce(
+                    manifest, prompt=prompt, workspace=workspace, configuration=config_block, on_crew=_instrument
                 )
-            config = loader.load_config(bundle_root / "config")
-            tools = sandbox.build_tools(config.tool_refs, workspace=workspace)
-            crew = loader.build_crew(config, tools)
-            model_id = _resolved_model_id(crew) or model_id
-            _attach_task_callback(crew, recorder, model_id=model_id)
-            result = crew.kickoff(inputs={"prompt": prompt, "configuration": config_block})
+                model_id = next((m for m in map(_resolved_model_id, workforce_crews) if m), model_id)
+            else:
+                if manifest_error is not None and on_notice is not None:
+                    on_notice(
+                        f"workforce.yaml could not be loaded ({manifest_error}); falling back to the flattened crew "
+                        "config."
+                    )
+                config = loader.load_config(bundle_root / "config")
+                tools = sandbox.build_tools(config.tool_refs, workspace=workspace)
+                crew = loader.build_crew(config, tools)
+                model_id = _resolved_model_id(crew) or model_id
+                if usage is not None:
+                    usage.watch(crew)
+                _attach_task_callback(crew, recorder, model_id=model_id)
+                result = crew.kickoff(inputs={"prompt": prompt, "configuration": config_block})
     except ModuleNotFoundError as exc:
         # crewai and its tree are imported lazily, so a bundle whose
         # requirements were never installed fails here rather than at import.
@@ -380,6 +425,107 @@ class _StepRecorder:
                 # stream client stops an agent: the relay's write fails, the
                 # exception unwinds through crewai, and no further task starts.
                 self._on_step(step)
+
+
+class _UsageListener:
+    """Hands ``on_usage`` what a run has spent so far, each time crewai finishes a model call.
+
+    Read as a step's tokens are read (``_crew_usage_snapshot``), summed over
+    every crew the run has built, all or nothing (``_summed_counts``), so the
+    running totals and the steps' deltas come from one source and agree. A
+    reading is handed on only when it moved: crewai fires one event per call,
+    and the totals it counts are the same until the next call is counted.
+
+    crewai calls the handler on a thread of its own, after the call it reports,
+    so the lock keeps two readings from being handed on out of order. Once the
+    run has returned, nothing more is handed on: a reading still in crewai's
+    pool would otherwise reach the worker after its ``done``.
+    """
+
+    def __init__(self, on_usage: Callable[[RunUsage], None], *, model_id: str) -> None:
+        self._on_usage = on_usage
+        self._model_id = model_id
+        self._crews: list[Any] = []
+        self._last: _Counts | None = None
+        self._closed = False
+        self._lock = threading.Lock()
+
+    def watch(self, crew: Any) -> None:
+        """Count ``crew`` in the run's totals from now on."""
+        with self._lock:
+            self._crews.append(crew)
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+
+    def report(self) -> None:
+        """Read the run's totals and hand them on, if they moved since the last reading. Never raises."""
+        with self._lock:
+            if self._closed:
+                return
+            counts = _summed_counts(self._crews)
+            if counts is None or counts == self._last:
+                return
+            self._last = counts
+            model_id = next((m for m in map(_resolved_model_id, self._crews) if m), self._model_id)
+            reading = RunUsage(
+                input_tokens=counts.prompt_tokens,
+                output_tokens=counts.completion_tokens,
+                cache_write_tokens=counts.cache_write_tokens,
+                cache_read_tokens=counts.cache_read_tokens,
+                model_id=model_id,
+            )
+            try:
+                self._on_usage(reading)
+            except Exception:  # noqa: BLE001 - progress reporting is not the run
+                pass
+
+
+#: The longest a run waits, once it has returned, for crewai to call the handlers of its last events.
+_USAGE_FLUSH_SECONDS = 5.0
+
+
+@contextmanager
+def _reporting_usage(listener: _UsageListener | None) -> Iterator[None]:
+    """Listen for crewai's finished model calls for the length of the block, if anyone asked.
+
+    Guarded rather than assumed, as the task callback is: a crewai whose event
+    bus is missing or renamed costs a run its running usage, never the run. At
+    the end the bus is flushed, a bounded wait for the handlers crewai has still
+    to call, so the run's last call is reported before the listener closes; then
+    the handler is taken off the bus, so a process that runs again (the command
+    line, a test) does not hand one run's calls to another's listener.
+    """
+    if listener is None:
+        yield
+        return
+    try:
+        from crewai.events import LLMCallCompletedEvent, crewai_event_bus
+    except Exception:  # noqa: BLE001 - no bus to listen on: the steps still report
+        yield
+        return
+
+    def _finished_call(_source: Any, _event: Any) -> None:
+        listener.report()
+
+    try:
+        crewai_event_bus.on(LLMCallCompletedEvent)(_finished_call)
+    except Exception:  # noqa: BLE001 - as above
+        yield
+        return
+    try:
+        yield
+    finally:
+        try:
+            crewai_event_bus.flush(timeout=_USAGE_FLUSH_SECONDS)
+        except Exception:  # noqa: BLE001 - the run is over either way
+            pass
+        listener.close()
+        try:
+            crewai_event_bus.off(LLMCallCompletedEvent, _finished_call)
+        except Exception:  # noqa: BLE001 - as above
+            pass
 
 
 def _load_workforce_manifest(config_dir: Path) -> tuple[Any | None, Exception | None]:
@@ -659,6 +805,7 @@ __all__ = [
     "RunOutcome",
     "RUNNER_ENV_PREFIXES",
     "RunStep",
+    "RunUsage",
     "SIGRIX_MEMBER",
     "cache_split",
     "drop_runner_settings",

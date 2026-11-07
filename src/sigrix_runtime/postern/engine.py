@@ -62,12 +62,24 @@ MODEL_PRICING: dict[str, tuple[float, float]] = {
 # How long to wait for a killed worker to die before giving up on it.
 _REAP_SECONDS = 5
 
+#: Where this runner puts what the specification has no member for: the
+#: reverse-domain namespace SPEC 6 sanctions, which a client that does not
+#: know it ignores.
+SIGRIX_NAMESPACE = "org.sigrix"
+
+#: The stream event carrying what a run has spent so far, sent after each model
+#: call it makes. SPEC 4.3 has a client skip an event name it does not
+#: recognise, so a client that does not know this one reads the stream as
+#: before; the namespace keeps it from colliding with a name the specification
+#: may define later.
+USAGE_EVENT = f"{SIGRIX_NAMESPACE}.usage"
+
 logger = logging.getLogger("sigrix_runtime.postern")
 
 
 @dataclass
 class RunEvent:
-    """One frame from the worker, already in Postern's vocabulary."""
+    """One frame from the worker, already in Postern's vocabulary, or under :data:`SIGRIX_NAMESPACE`."""
 
     name: str
     payload: dict[str, Any]
@@ -180,7 +192,13 @@ class Engine:
         on_notice: Callable[[str], None] | None = None,
         mcp: dict[str, Any] | None = None,
     ) -> Generator[RunEvent, None, None]:
-        """Yield ``start``, zero or more ``step``, then exactly one ``done``.
+        """Yield ``start``, zero or more ``step`` and :data:`USAGE_EVENT`, then exactly one ``done``.
+
+        A :data:`USAGE_EVENT` is what the run has spent so far, every model
+        call counted, as the worker reads it after each call. A step reports
+        its tokens only when its task finishes, so the last of these is what a
+        run that ends inside a task had spent: the error it ends with carries
+        it under ``detail``, in :data:`SIGRIX_NAMESPACE`, as ``usage``.
 
         ``mcp`` makes the run an MCP server's tool call (:mod:`.mcp`) rather
         than the bundle's: the same worker, bounds and cancellation.
@@ -214,6 +232,7 @@ class Engine:
             steps: list[dict[str, Any]] = []
             failure: PosternError | None = None
             done: dict[str, Any] | None = None
+            spent: dict[str, Any] | None = None
             expired = threading.Event()
 
             for frame in self._frames(process, deadline=deadline, expired=expired):
@@ -222,6 +241,11 @@ class Engine:
                     step = {key: value for key, value in frame.items() if key != "event"}
                     steps.append(step)
                     yield RunEvent("step", {**step, "status": "finished"})
+                elif kind == "usage":
+                    reading = _running_usage(frame)
+                    if reading is not None:
+                        spent = reading
+                        yield RunEvent(USAGE_EVENT, reading)
                 elif kind == "notice":
                     if on_notice is not None:
                         on_notice(str(frame.get("text") or ""))
@@ -234,13 +258,16 @@ class Engine:
                 # The watchdog's verdict, not the clock's: read after the loop,
                 # the clock called a worker that finished a moment before its
                 # deadline a timeout and threw its answer away.
-                raise run_timeout(self.limits.max_run_seconds)
+                raise _having_spent(run_timeout(self.limits.max_run_seconds), spent)
             if failure is not None:
-                raise failure
+                raise _having_spent(failure, spent)
             if done is None:
-                raise agent_error(
-                    "The agent stopped without producing a result. `python doctor.py` in the bundle "
-                    "folder reports what went wrong on the last run."
+                raise _having_spent(
+                    agent_error(
+                        "The agent stopped without producing a result. `python doctor.py` in the bundle "
+                        "folder reports what went wrong on the last run."
+                    ),
+                    spent,
                 )
             yield RunEvent("done", _run_body(run_id, done, steps))
         finally:
@@ -392,6 +419,52 @@ def _failure_from(frame: dict[str, Any]) -> PosternError:
     return agent_error(message)
 
 
+def _running_usage(frame: dict[str, Any]) -> dict[str, Any] | None:
+    """A worker's ``usage`` frame as a :data:`USAGE_EVENT` payload, or ``None`` for one carrying no tokens.
+
+    The shape of a run's ``usage`` (SPEC 4.2) without its steps or its
+    estimated cost: the run's totals so far, the cache split under
+    :data:`SIGRIX_NAMESPACE` as the run's is, and the model they were spent on.
+    """
+    try:
+        input_tokens = int(frame.get("input_tokens") or 0)
+        output_tokens = int(frame.get("output_tokens") or 0)
+    except (TypeError, ValueError):
+        return None
+    if input_tokens <= 0 and output_tokens <= 0:
+        return None
+    reading: dict[str, Any] = {"input_tokens": input_tokens, "output_tokens": output_tokens}
+    cache = frame.get("cache")
+    if isinstance(cache, dict) and cache:
+        reading[SIGRIX_NAMESPACE] = dict(cache)
+    model_id = str(frame.get("model_id") or "")
+    if model_id:
+        reading["model_id"] = model_id
+    return reading
+
+
+def _having_spent(error: PosternError, spent: dict[str, Any] | None) -> PosternError:
+    """``error``, carrying what the run had spent when it ended, if anything was read.
+
+    Under ``detail`` (the envelope's one extension point, SPEC 2.1), in
+    :data:`SIGRIX_NAMESPACE`, beside whatever ``detail`` already says, such as a
+    timeout's ``max_run_seconds``. A ``detail`` that is a sentence rather than
+    an object has nowhere to put it, and is left as it is.
+    """
+    if spent is None:
+        return error
+    if error.detail is None:
+        detail: dict[str, Any] = {}
+    elif isinstance(error.detail, dict):
+        detail = dict(error.detail)
+    else:
+        return error
+    namespace = detail.get(SIGRIX_NAMESPACE)
+    detail[SIGRIX_NAMESPACE] = {**(namespace if isinstance(namespace, dict) else {}), "usage": dict(spent)}
+    error.detail = detail
+    return error
+
+
 def _run_body(run_id: str, done: dict[str, Any], steps: list[dict[str, Any]]) -> dict[str, Any]:
     """SPEC 4.2's response body. No ``status`` member — there is no such field."""
     body: dict[str, Any] = {
@@ -410,7 +483,7 @@ def _run_body(run_id: str, done: dict[str, Any], steps: list[dict[str, Any]]) ->
         # files appeared cannot point a buyer at their own deliverable.
         # Rides under the reverse-domain namespace SPEC 6 sanctions, so a
         # client that does not know it ignores it.
-        body["org.sigrix"] = {"files_written": [str(name) for name in files]}
+        body[SIGRIX_NAMESPACE] = {"files_written": [str(name) for name in files]}
     return body
 
 
@@ -427,7 +500,7 @@ def _usage(done: dict[str, Any], steps: list[dict[str, Any]]) -> dict[str, Any]:
         # ``files_written`` does, which a client that does not know it ignores.
         cache = done.get("cache")
         if isinstance(cache, dict) and cache:
-            usage["org.sigrix"] = dict(cache)
+            usage[SIGRIX_NAMESPACE] = dict(cache)
         cost = estimate_cost(str(done.get("model_id") or ""), input_tokens, output_tokens)
         if cost is not None:
             usage["cost_usd"] = cost
@@ -468,6 +541,8 @@ def _terminate(process: subprocess.Popen[str]) -> None:
 
 __all__ = [
     "MODEL_PRICING",
+    "SIGRIX_NAMESPACE",
+    "USAGE_EVENT",
     "Engine",
     "Limits",
     "RunEvent",
