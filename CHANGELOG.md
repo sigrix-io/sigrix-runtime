@@ -6,6 +6,14 @@ described in `VERSIONING.md`.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-07
+
+A run says what it has spent as it goes: after every model call it makes,
+and on the error it ends with, so a run stopped at a budget or cut off
+inside a task still says what it spent. Both ride where the specification
+leaves room, an event name a client skips and a member of an error's
+`detail`, so nothing a client already reads changes shape.
+
 ### Added
 
 - A stream reports what its run has spent after every model call the run
