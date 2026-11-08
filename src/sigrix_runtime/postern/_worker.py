@@ -121,6 +121,7 @@ def main() -> int:
             # Shaped here, where a step's own split is, so the engine places
             # the run's under the namespace without naming a member itself.
             "cache": execution.cache_split(outcome.cache_write_tokens, outcome.cache_read_tokens),
+            "calls": outcome.calls,
             "model_id": outcome.model_id,
             "duration_seconds": outcome.duration_seconds,
         }

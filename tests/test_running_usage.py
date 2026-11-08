@@ -6,7 +6,7 @@ spent, and a client pricing runs priced it at nothing. Now:
 
 1. ``execution.execute`` hands ``on_usage`` the run's running totals after each
    model call crewai reports on its event bus, summed over every crew the run
-   has built, and only when they moved.
+   has built, and only when they moved, with how many calls they count.
 2. The worker writes each as a ``usage`` frame, and the engine relays it as an
    ``org.sigrix.usage`` stream event in the shape of a run's ``usage``. SPEC 4.3
    has a client skip an event name it does not know, so nothing else changes.
@@ -52,13 +52,23 @@ from tests.test_server import _events, _serve
 
 
 class _Totals:
-    def __init__(self, prompt: int, completion: int, *, written: int | None = None, read: int | None = None) -> None:
+    def __init__(
+        self,
+        prompt: int,
+        completion: int,
+        *,
+        written: int | None = None,
+        read: int | None = None,
+        requests: int | None = None,
+    ) -> None:
         self.prompt_tokens = prompt
         self.completion_tokens = completion
         if written is not None:
             self.cache_creation_tokens = written
         if read is not None:
             self.cached_prompt_tokens = read
+        if requests is not None:
+            self.successful_requests = requests
 
 
 class _LLM:
@@ -124,6 +134,37 @@ def test_a_workforce_reading_sums_every_crew_and_one_crew_that_cannot_say_leaves
     assert (readings[0].cache_write_tokens, readings[0].cache_read_tokens) == (None, None)
 
 
+def test_each_reading_counts_the_calls_crewai_counted_with_its_tokens() -> None:
+    """crewai's ``successful_requests``, read with the tokens. Two calls crewai counted before the first one's reading
+    was read come as one reading counting two more: a client pricing one call by its prompt can tell it apart."""
+    listener, readings = _listener()
+    crew = _Crew()
+    listener.watch(crew)
+
+    crew.totals = _Totals(1600, 300, requests=1)
+    listener.report()
+    crew.totals = _Totals(4800, 900, requests=3)
+    listener.report()
+    crew.totals = _Totals(6400, 1200)
+    listener.report()
+
+    assert [reading.calls for reading in readings] == [1, 3, None], "a count crewai did not give was made up"
+    assert [reading.input_tokens for reading in readings] == [1600, 4800, 6400]
+
+
+def test_a_workforce_reading_counts_every_crews_calls_and_one_crew_that_cannot_count_leaves_none() -> None:
+    listener, readings = _listener()
+    unit, manager = _Crew(), _Crew()
+    listener.watch(unit)
+    listener.watch(manager)
+    unit.totals, manager.totals = _Totals(1600, 300, requests=2), _Totals(800, 100, requests=1)
+    listener.report()
+    manager.totals = _Totals(1600, 200)
+    listener.report()
+
+    assert [(reading.input_tokens, reading.calls) for reading in readings] == [(2400, 3), (3200, None)]
+
+
 def test_nothing_is_handed_on_before_a_crew_is_watched_or_after_the_run_has_returned() -> None:
     listener, readings = _listener()
     listener.report()
@@ -158,7 +199,7 @@ def test_a_handler_that_raises_does_not_reach_the_run() -> None:
 
 
 def test_the_frame_keeps_the_cache_split_apart_and_says_nothing_it_was_not_told() -> None:
-    told = execution.RunUsage(1600, 300, cache_write_tokens=1000, cache_read_tokens=500, model_id=MODEL_ID)
+    told = execution.RunUsage(1600, 300, cache_write_tokens=1000, cache_read_tokens=500, model_id=MODEL_ID, calls=2)
     untold = execution.RunUsage(1600, 300)
 
     assert told.as_frame() == {
@@ -166,6 +207,7 @@ def test_the_frame_keeps_the_cache_split_apart_and_says_nothing_it_was_not_told(
         "output_tokens": 300,
         "cache": {"cache_write_tokens": 1000, "cache_read_tokens": 500},
         "model_id": MODEL_ID,
+        "calls": 2,
     }
     assert untold.as_frame() == {"input_tokens": 1600, "output_tokens": 300, "cache": {}}
 
@@ -275,7 +317,7 @@ def _scripted(engine: Engine, monkeypatch: pytest.MonkeyPatch, frames: list[Any]
 
 
 _SPENT = {"event": "usage", "input_tokens": 1600, "output_tokens": 300, "cache": {"cache_write_tokens": 1000}}
-_SPENT_MORE = {"event": "usage", "input_tokens": 3200, "output_tokens": 600, "model_id": MODEL_ID}
+_SPENT_MORE = {"event": "usage", "input_tokens": 3200, "output_tokens": 600, "model_id": MODEL_ID, "calls": 2}
 
 
 def _streamed(engine: Engine) -> tuple[list[tuple[str, dict[str, Any]]], PosternError | None]:
@@ -299,9 +341,33 @@ def test_each_usage_frame_is_relayed_as_the_namespaced_event_in_the_shape_of_a_r
 
     assert failure is None
     assert USAGE_EVENT == "org.sigrix.usage"
+    assert engine_module.CALLS_MEMBER == "calls", "a client reads the count by this name"
     assert [name for name, _ in events] == ["start", USAGE_EVENT, USAGE_EVENT, "done"]
     assert events[1][1] == {"input_tokens": 1600, "output_tokens": 300, SIGRIX_NAMESPACE: {"cache_write_tokens": 1000}}
-    assert events[2][1] == {"input_tokens": 3200, "output_tokens": 600, "model_id": MODEL_ID}
+    assert events[2][1] == {
+        "input_tokens": 3200,
+        "output_tokens": 600,
+        SIGRIX_NAMESPACE: {"calls": 2},
+        "model_id": MODEL_ID,
+    }
+
+
+@pytest.mark.parametrize("calls", [0, -1, True, "2", 2.0, None])
+def test_a_call_count_that_is_not_a_count_is_left_out(calls: Any) -> None:
+    frame = {"input_tokens": 1600, "output_tokens": 300, "cache": {"cache_write_tokens": 1000}, "calls": calls}
+    assert engine_module._running_usage(frame) == {
+        "input_tokens": 1600,
+        "output_tokens": 300,
+        SIGRIX_NAMESPACE: {"cache_write_tokens": 1000},
+    }
+
+
+def test_a_runs_usage_counts_its_calls_where_its_readings_do() -> None:
+    """A reading is a run's ``usage`` without its steps or its cost, so the run's own carries the count the same way,
+    and a run whose last reading was its totals ends with one ``usage`` the reading agrees with."""
+    done = {"input_tokens": 4800, "output_tokens": 900, "cache": {"cache_write_tokens": 3000}, "calls": 3}
+    assert engine_module._usage(done, [])[SIGRIX_NAMESPACE] == {"cache_write_tokens": 3000, "calls": 3}
+    assert SIGRIX_NAMESPACE not in engine_module._usage({"input_tokens": 4800, "output_tokens": 900}, [])
 
 
 @pytest.mark.parametrize(
@@ -383,7 +449,11 @@ def _per_call(calls: int) -> dict[str, Any]:
     return {
         "input_tokens": INPUT_PER_CALL * calls,
         "output_tokens": OUTPUT_PER_CALL * calls,
-        SIGRIX_NAMESPACE: {"cache_write_tokens": WRITTEN_PER_CALL * calls, "cache_read_tokens": READ_PER_CALL * calls},
+        SIGRIX_NAMESPACE: {
+            "cache_write_tokens": WRITTEN_PER_CALL * calls,
+            "cache_read_tokens": READ_PER_CALL * calls,
+            "calls": calls,
+        },
         "model_id": MODEL_ID,
     }
 
