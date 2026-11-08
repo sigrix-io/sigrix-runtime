@@ -6,6 +6,20 @@ described in `VERSIONING.md`.
 
 ## [Unreleased]
 
+### Added
+
+- Each `org.sigrix.usage` reading, and a run's `usage`, counts the model
+  calls its totals hold, as `calls` under `org.sigrix`, beside the cache
+  split. It is CrewAI's own count (`successful_requests`), read with the
+  tokens. A reading after one call counts one more than the reading before
+  it. A reading that counts two more holds two calls whose tokens CrewAI had
+  both counted before the first one's reading was read: a panel's units, or
+  tasks that run at once. A client that prices a call by its prompt's length,
+  as Anthropic bills a call over Claude Haiku 5.5's 100,000-token step, can
+  tell one large call from two smaller ones only by this. Left out while
+  CrewAI does not say, and a workforce's is left out while any of its crews
+  cannot say.
+
 ## [0.3.0] - 2026-11-07
 
 A run says what it has spent as it goes: after every model call it makes,

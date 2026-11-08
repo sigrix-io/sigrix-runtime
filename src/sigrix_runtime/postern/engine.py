@@ -74,6 +74,11 @@ SIGRIX_NAMESPACE = "org.sigrix"
 #: may define later.
 USAGE_EVENT = f"{SIGRIX_NAMESPACE}.usage"
 
+#: The member of a reading's, and a run's, :data:`SIGRIX_NAMESPACE` that counts
+#: the model calls its totals hold (``execution.RunUsage.calls``). A client that
+#: tells one call from two reads it by this name, so it is named once, here.
+CALLS_MEMBER = "calls"
+
 logger = logging.getLogger("sigrix_runtime.postern")
 
 
@@ -425,6 +430,9 @@ def _running_usage(frame: dict[str, Any]) -> dict[str, Any] | None:
     The shape of a run's ``usage`` (SPEC 4.2) without its steps or its
     estimated cost: the run's totals so far, the cache split under
     :data:`SIGRIX_NAMESPACE` as the run's is, and the model they were spent on.
+    Beside the split, in the namespace, ``calls``: how many model calls the
+    totals count, when crewai said, so a client can tell a reading that adds one
+    call from one that adds two (``execution.RunUsage``).
     """
     try:
         input_tokens = int(frame.get("input_tokens") or 0)
@@ -434,13 +442,24 @@ def _running_usage(frame: dict[str, Any]) -> dict[str, Any] | None:
     if input_tokens <= 0 and output_tokens <= 0:
         return None
     reading: dict[str, Any] = {"input_tokens": input_tokens, "output_tokens": output_tokens}
-    cache = frame.get("cache")
-    if isinstance(cache, dict) and cache:
-        reading[SIGRIX_NAMESPACE] = dict(cache)
+    member = _sigrix_member(frame)
+    if member:
+        reading[SIGRIX_NAMESPACE] = member
     model_id = str(frame.get("model_id") or "")
     if model_id:
         reading["model_id"] = model_id
     return reading
+
+
+def _sigrix_member(frame: dict[str, Any]) -> dict[str, Any]:
+    """What a worker's ``usage`` or ``done`` frame carries under :data:`SIGRIX_NAMESPACE`: the cache split, then
+    ``calls`` when it is a count of one or more. Empty when the frame says neither, so the namespace is left out."""
+    cache = frame.get("cache")
+    member: dict[str, Any] = dict(cache) if isinstance(cache, dict) else {}
+    calls = frame.get("calls")
+    if isinstance(calls, int) and not isinstance(calls, bool) and calls > 0:
+        member[CALLS_MEMBER] = calls
+    return member
 
 
 def _having_spent(error: PosternError, spent: dict[str, Any] | None) -> PosternError:
@@ -495,12 +514,13 @@ def _usage(done: dict[str, Any], steps: list[dict[str, Any]]) -> dict[str, Any]:
         usage["input_tokens"] = input_tokens
         usage["output_tokens"] = output_tokens
         # How many of ``input_tokens`` the provider wrote to its prompt cache
-        # and read from it, as each step carries its own. Postern's ``usage``
-        # has no member for them, so they ride under the namespace the body's
-        # ``files_written`` does, which a client that does not know it ignores.
-        cache = done.get("cache")
-        if isinstance(cache, dict) and cache:
-            usage[SIGRIX_NAMESPACE] = dict(cache)
+        # and read from it, as each step carries its own, and how many model
+        # calls the totals count. Postern's ``usage`` has no member for them,
+        # so they ride under the namespace the body's ``files_written`` does,
+        # which a client that does not know it ignores.
+        member = _sigrix_member(done)
+        if member:
+            usage[SIGRIX_NAMESPACE] = member
         cost = estimate_cost(str(done.get("model_id") or ""), input_tokens, output_tokens)
         if cost is not None:
             usage["cost_usd"] = cost
@@ -540,6 +560,7 @@ def _terminate(process: subprocess.Popen[str]) -> None:
 
 
 __all__ = [
+    "CALLS_MEMBER",
     "MODEL_PRICING",
     "SIGRIX_NAMESPACE",
     "USAGE_EVENT",

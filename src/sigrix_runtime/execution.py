@@ -138,6 +138,15 @@ class RunUsage:
     time limit, a cancel, a crash) reported nothing for that task; this is
     what it had spent when it stopped. The cache counts are inside
     ``input_tokens``, as a step's are, and ``None`` when crewai did not say.
+
+    ``calls`` is how many model calls the totals count, crewai's own
+    ``successful_requests``, read with the tokens: a reading after one call
+    counts one more than the reading before it, and a reading that counts two
+    more holds two calls whose tokens crewai had both counted before the first
+    one's reading was read (a panel's units, or tasks running at once). A
+    client that prices one call by its prompt's length, as Anthropic bills a
+    call past a model's price step, can tell the two apart only by this.
+    ``None`` when crewai did not say.
     """
 
     input_tokens: int
@@ -145,6 +154,7 @@ class RunUsage:
     cache_write_tokens: int | None = None
     cache_read_tokens: int | None = None
     model_id: str = ""
+    calls: int | None = None
 
     def as_frame(self) -> dict[str, Any]:
         """The worker's frame: the cache split apart, for the engine to place as it places a run's."""
@@ -155,6 +165,8 @@ class RunUsage:
         }
         if self.model_id:
             payload["model_id"] = self.model_id
+        if self.calls is not None:
+            payload["calls"] = self.calls
         return payload
 
 
@@ -175,6 +187,8 @@ class RunOutcome:
     cache_read_tokens: int | None = None
     model_id: str = ""
     duration_seconds: float = 0.0
+    # The model calls the totals count, as RunUsage.calls says it of a reading.
+    calls: int | None = None
     # True when the bundle carried a workforce.yaml manifest and it loaded.
     # A front end that wants to say "orchestrated N unit crews" needs to know
     # which of the two shapes ran; nothing else does.
@@ -475,6 +489,7 @@ class _UsageListener:
                 cache_write_tokens=counts.cache_write_tokens,
                 cache_read_tokens=counts.cache_read_tokens,
                 model_id=model_id,
+                calls=counts.requests,
             )
             try:
                 self._on_usage(reading)
@@ -582,7 +597,7 @@ def _attach_task_callback(crew: Any, record: Callable[..., None], *, model_id: s
     without that list times the first step from here.
     """
     lock = threading.Lock()
-    previous = _Counts(prompt_tokens=0, completion_tokens=0, cache_write_tokens=0, cache_read_tokens=0)
+    previous = _Counts(prompt_tokens=0, completion_tokens=0, cache_write_tokens=0, cache_read_tokens=0, requests=0)
     clock = {"last": time.perf_counter()}
 
     def _kicked_off(inputs: Any) -> Any:
@@ -664,20 +679,26 @@ class _Counts:
     and ``cached_prompt_tokens`` (both on ``UsageMetrics`` since this extra's
     floor, 1.15.20). A cache count is ``None`` when the reading has no such
     field, which says nothing, where a zero says no cache was used.
+
+    ``requests`` is crewai's ``successful_requests``, the model calls the
+    totals count, kept the same way: ``None`` when the reading has no such
+    field, and a sum with an unknown count is unknown.
     """
 
     prompt_tokens: int
     completion_tokens: int
     cache_write_tokens: int | None
     cache_read_tokens: int | None
+    requests: int | None = None
 
     def plus(self, other: _Counts) -> _Counts:
-        """Two crews' totals together; a cache count either one lacks is unknown."""
+        """Two crews' totals together; a cache count or a call count either one lacks is unknown."""
         return _Counts(
             prompt_tokens=self.prompt_tokens + other.prompt_tokens,
             completion_tokens=self.completion_tokens + other.completion_tokens,
             cache_write_tokens=_count_plus(self.cache_write_tokens, other.cache_write_tokens),
             cache_read_tokens=_count_plus(self.cache_read_tokens, other.cache_read_tokens),
+            requests=_count_plus(self.requests, other.requests),
         )
 
     def since(self, earlier: _Counts) -> _Counts:
@@ -687,6 +708,7 @@ class _Counts:
             completion_tokens=max(0, self.completion_tokens - earlier.completion_tokens),
             cache_write_tokens=_count_since(self.cache_write_tokens, earlier.cache_write_tokens),
             cache_read_tokens=_count_since(self.cache_read_tokens, earlier.cache_read_tokens),
+            requests=_count_since(self.requests, earlier.requests),
         )
 
 
@@ -718,6 +740,7 @@ def _read_counts(usage: Any) -> _Counts:
         completion_tokens=int(getattr(usage, "completion_tokens", 0) or 0),
         cache_write_tokens=_optional_count(usage, "cache_creation_tokens"),
         cache_read_tokens=_optional_count(usage, "cached_prompt_tokens"),
+        requests=_optional_count(usage, "successful_requests"),
     )
 
 
@@ -760,7 +783,7 @@ def _summed_counts(crews: list[Any]) -> _Counts | None:
     """
     if not crews:
         return None
-    total = _Counts(prompt_tokens=0, completion_tokens=0, cache_write_tokens=0, cache_read_tokens=0)
+    total = _Counts(prompt_tokens=0, completion_tokens=0, cache_write_tokens=0, cache_read_tokens=0, requests=0)
     for crew in crews:
         counts = _crew_usage_snapshot(crew)
         if counts is None:
@@ -789,6 +812,7 @@ def _attach_totals(outcome: RunOutcome, counts: _Counts | None) -> None:
     outcome.output_tokens = counts.completion_tokens
     outcome.cache_write_tokens = counts.cache_write_tokens
     outcome.cache_read_tokens = counts.cache_read_tokens
+    outcome.calls = counts.requests
 
 
 def _workspace_files(workspace: Path) -> set[str]:

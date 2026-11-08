@@ -479,9 +479,11 @@ def test_a_real_crew_on_claude_reports_the_cache_split_its_provider_measured(
     usage = body["usage"]
     # crewai counts the cache inside the input, and the runner keeps that meaning.
     assert (usage["input_tokens"], usage["output_tokens"]) == (INPUT_PER_CALL * calls, OUTPUT_PER_CALL * calls)
+    # Beside the split, the model calls crewai counted, which the stand-in counted too.
     assert usage["org.sigrix"] == {
         "cache_write_tokens": WRITTEN_PER_CALL * calls,
         "cache_read_tokens": READ_PER_CALL * calls,
+        "calls": calls,
     }
     steps = usage["steps"]
     assert [step["name"] for step in steps] == ["summarise_contract", "identify_risks", "draft_negotiation_play"]
