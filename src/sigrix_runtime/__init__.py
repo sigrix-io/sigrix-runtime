@@ -15,4 +15,4 @@ from __future__ import annotations
 
 #: The package's one version, which its build reads. A bundle states its own
 #: version in its ``VERSION`` file.
-__version__ = "0.3.0"
+__version__ = "0.4.0"

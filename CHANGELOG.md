@@ -6,6 +6,15 @@ described in `VERSIONING.md`.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-08
+
+A run counts the model calls it has made: each reading a stream sends after
+a call, and a run's own `usage`, now say how many calls their totals hold.
+So a client that prices a call by its prompt's length can tell one large
+call from two smaller ones whose tokens arrived together. The count rides
+beside the cache split, under `org.sigrix`, so nothing a client already
+reads changes shape.
+
 ### Added
 
 - Each `org.sigrix.usage` reading, and a run's `usage`, counts the model
